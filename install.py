@@ -58,9 +58,16 @@ def check(settings):
 
 
 def remove_hooks(settings):
+    """Take our hook out of every entry. An entry goes only when nothing else is left in it."""
     hooks = settings.get("hooks", {})
     for event in list(hooks):
-        kept = [e for e in hooks[event] if not ours(e)]
+        kept = []
+        for e in hooks[event]:
+            if ours(e):
+                e["hooks"] = [h for h in e["hooks"] if h.get("command") != BIN]
+                if not e["hooks"]:
+                    continue
+            kept.append(e)
         if kept or len(kept) == len(hooks[event]):
             hooks[event] = kept
         else:

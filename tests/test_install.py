@@ -51,6 +51,17 @@ class InstallTest(unittest.TestCase):
         self.run_install("--uninstall")
         self.assertEqual(self.read(), original)
 
+    def test_a_hook_sharing_our_entry_is_kept(self):
+        mine = {"type": "command", "command": "say done"}
+        self.write({"hooks": {"Stop": [{"hooks": [mine]}]}})
+        self.run_install()
+        installed = self.read()
+        installed["hooks"]["Stop"][-1]["hooks"].append(mine)  # merged by hand into our entry
+        self.write(installed)
+        self.run_install("--uninstall")
+        commands = [h["command"] for e in self.read()["hooks"]["Stop"] for h in e["hooks"]]
+        self.assertEqual(commands, ["say done", "say done"])
+
     def test_round_trip_from_bare_settings(self):
         self.write({"model": "opus"})
         self.run_install()

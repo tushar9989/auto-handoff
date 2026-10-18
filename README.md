@@ -32,6 +32,11 @@ clean point. The handoff is then loaded into the fresh context automatically.
    conversation being summarized names that slot as the agent's own. Each agent is told its own slot
    when it starts, when it's asked for a handoff, and after each compaction, and no other agent is
    told it. Otherwise the summary is the usual full one.
+
+   A handoff written well before its compaction comes (the context has grown more than 20k since,
+   say because the agent was asked early and went on working) is asked for again first. If the
+   context shrinks well below the compaction point without a compaction (a rewind), the agent is no
+   longer asked.
 5. Right after compaction, the hook loads the handoff into the fresh context: inline up to 9.5k
    characters, otherwise as a path to read. Every message that returns from a compaction opens with
    "A note from the user: make no mistakes. I love you.", even when there's nothing to load.
@@ -44,11 +49,12 @@ clean point. The handoff is then loaded into the fresh context automatically.
 Claude Code's compaction hooks don't say which agent is compacting (issue
 [#91910](https://github.com/anthropics/claude-code/issues/91910)), so each agent announces itself:
 - **Before every request**, Claude Code checks whether the context has reached the compaction point.
-  It sizes the context as the last response's input and output, plus everything added since, at
-  3 bytes per token (4 for older models), with 2,000 tokens for each image or document.
+  It sizes the context as the last response's input and output, plus everything added since (its
+  tool calls, their results, a prompt), at 3 bytes per token (4 for older models), with 2,000 tokens
+  for each image or document.
 - **The hook does the same sum** on the events just before a request, which do say who the agent is.
-  Those events are a batch of tool results (PostToolBatch, with the results themselves), a new prompt,
-  and a Stop the hook blocks. If the agent's next request reaches its compaction point (less 3k for
+  Those events are a batch of tool results (PostToolBatch, which carries the calls and the results),
+  a new prompt, and a Stop the hook blocks. If the agent's next request reaches its compaction point (less 3k for
   small extras), the hook writes `<session>/crossing/<agent>`.
 - **PreCompact follows within about 40ms**, so the newest announcement from the last 5 seconds is
   the compacting agent. Another agent would have to announce inside those 40ms to be taken instead.
@@ -132,7 +138,8 @@ files included. Handoffs being pruned also get a `_before-trim` copy.
 
 - `/compact` always goes through, and loads a handoff if one was written since the last compaction.
 - `/clear` starts afresh: a handoff written but not yet loaded stays in the old session's folder.
-- In plan mode the main session can't write files, so its compaction isn't held and Stop doesn't ask.
+- An agent in plan mode, main or a subagent, can't write files, so its compaction isn't held and it
+  isn't asked.
 - Models with a 200k window aren't held. They compact only about 30k below their limit, which
   leaves no room to wait safely. They compact as usual, without a handoff.
 - Idle compaction and background summary precompute are turned off by the installer, because both
@@ -168,6 +175,7 @@ What it changed is recorded in `~/.claude/hooks/auto-handoff.install.json`:
   backup, is managed again.
 - **Your file is edited in place.** A symlinked `settings.json` stays a symlink and keeps its
   permissions.
+- **Only its own hook is removed.** A hook of yours that shares an entry with it stays.
 - **Unexpected settings are refused.** If `settings.json` isn't valid JSON or has an unexpected
   shape, nothing is changed and the script says where.
 
@@ -219,7 +227,7 @@ of it undocumented:
   compacting agent's PostToolBatch (which carries the id and the tool results) by about 40ms, and
   SessionStart(compact) context reaches the agent that compacted.
 - The compaction check sizes the context the way "Which agent is compacting" describes (read in
-  2.1.302's code, and matching every batch in a live probe).
+  2.1.302's code; a live probe of Read batches matched it every time).
 - Each compaction writes a `compact_boundary` line into the compacted agent's own transcript.
 - The summarizer sees only the earlier part of the conversation. A recent stretch is kept word for
   word after the summary, so the summarizer never sees the handoff being written.
@@ -240,7 +248,8 @@ of it undocumented:
   These are a subagent's first request with a large inherited context, and messages that arrive
   without a prompt event. A subagent's compaction there goes through without its handoff. If main is
   near its point at that moment, main is asked for its handoff early instead, and the subagent's
-  compaction waits until its next request, which it does announce.
+  compaction waits until its next request, which it does announce. If main then goes on working,
+  its handoff is asked for again once it's outgrown.
 - **Settings the hook doesn't read:** `CLAUDE_CODE_AUTO_COMPACT_WINDOW`,
   `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, a subagent definition's own `autoCompactWindow`, a project's own
   setting, one passed with `--settings`, and windows tuned by the server. Agents they apply to may

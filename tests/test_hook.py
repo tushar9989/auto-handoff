@@ -189,6 +189,29 @@ class HookTest(unittest.TestCase):
         self.tool()
         self.assertTrue(self.shortens_summary(self.compact()))
 
+    def test_outgrown_handoff_is_asked_for_again(self):
+        # Asked early, main writes its handoff, then goes on working: by the time its compaction comes,
+        # the handoff no longer covers the work since, so it's asked for again.
+        self.hold()
+        self.write_handoff("main", "Owner: main session - early")
+        self.tool()  # the batch that wrote it
+        self.tokens("main", 330_000)
+        self.tool()
+        self.assertTrue(self.blocked(self.compact()))
+        self.assertIn("compaction is waiting", self.ctx(self.tool()))
+        self.write_handoff("main", "Owner: main session - current")
+        self.tool()
+        self.assertTrue(self.shortens_summary(self.compact()))
+        self.assertIn("current", self.returned())
+
+    def test_shrunk_context_stops_waiting(self):
+        # Rewound while a handoff was pending: no longer near the compaction point, so no more asking.
+        self.hold()
+        self.tokens("main", 200_000)
+        self.assertEqual(self.ctx(self.tool()), "")
+        self.assertNotIn("pending", self.agents()["main"])
+        self.assertIsNone(self.run_hook("Stop", stop_hook_active=False))
+
     def test_stop_forces_handoff_once(self):
         self.hold()
         out = self.run_hook("Stop", stop_hook_active=False)
@@ -285,6 +308,23 @@ class HookTest(unittest.TestCase):
         self.assertTrue(self.blocked(self.compact()))
         self.assertIn("pending", self.agents()["main"])
         self.assertNotIn("agentNew", self.agents())
+
+    def test_subagent_in_plan_mode_is_not_held(self):
+        self.tokens("main", 50_000)
+        self.tokens("p", 300_000)
+        self.run_hook("SubagentStart", "p", agent_type="general-purpose")
+        self.run_hook("PostToolBatch", "p", permission_mode="plan", tool_calls=[
+            {"tool_name": "Read", "tool_input": {"file_path": "x"}, "tool_use_id": "t", "tool_response": "ok"}])
+        self.assertFalse(self.blocked(self.compact()))
+
+    def test_tool_input_counts_toward_the_next_request(self):
+        # Claude Code counts the tool calls of the latest response too, so a big Write moves the size.
+        self.tokens("main", 50_000)
+        self.tokens("agentA", 280_000)
+        self.run_hook("PostToolBatch", "agentA", tool_calls=[
+            {"tool_name": "Write", "tool_input": {"file_path": "big.md", "content": "w" * 60_000},
+             "tool_use_id": "t", "tool_response": "File created"}])
+        self.assertTrue(self.blocked(self.compact()))
 
     def test_old_announcement_is_ignored(self):
         # An agent that announced but didn't compact (it finished, or the estimate was off) is no
@@ -510,6 +550,22 @@ class HookTest(unittest.TestCase):
         self.tool("A")  # A's activity is newest, but A is small now
         self.assertTrue(self.blocked(self.compact()))
         self.assertIn("pending", self.agents()["B"])
+
+    def test_compaction_found_past_large_results(self):
+        # The first batch after a compaction wrote over 4MB (screenshots): the compaction still counts.
+        self.hold()
+        self.write_handoff("main", "Owner: main session - first cycle")
+        self.tool()
+        self.assertTrue(self.shortens_summary(self.compact()))
+        self.returned()
+        with open(self.transcript, "a") as f:
+            for _ in range(8):
+                f.write(json.dumps({"type": "user", "message": {"content": [{"type": "image", "data": "A" * 650_000}]}}) + "\n")
+            f.write(json.dumps({"type": "assistant", "message": {"model": "claude-opus-5-5", "usage": {
+                "input_tokens": 1, "cache_read_input_tokens": 40_000}}}) + "\n")
+        self.tool()
+        self.assertEqual(list(self.agents()["main"]), ["compacted"])  # settled, not waiting again
+        self.assertFalse(os.path.exists(os.path.join(self.d, "main.md")))
 
     def test_output_tokens_count(self):
         entry = {"type": "assistant", "message": {"model": "claude-opus-5-5", "usage": {
