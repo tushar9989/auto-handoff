@@ -26,7 +26,8 @@ PERMISSIONS = ["%s(~/.local/state/claude-handoffs/**)" % t for t in ("Read", "Ed
 WINDOW = 333000
 # Every model family with a native 1M window, by the canonical names modelSettings uses.
 MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1", "claude-fable-5",
-          "claude-mythos-5-1", "claude-mythos-5", "claude-opus-5", "claude-sonnet-5"]
+          "claude-mythos-5-1", "claude-mythos-5", "claude-opus-5", "claude-sonnet-5", "claude-opus-4-8",
+          "claude-opus-4-7"]
 OFF = {"idleCompaction": False, "precomputeCompactionEnabled": False}
 ABSENT = "<absent>"
 
@@ -80,9 +81,26 @@ def install(settings):
         "allow_existed": "allow" in settings.get("permissions", {}),
         "added_allow": [], "windows": {}, "models_existed": {}, "settings": {},
     }
-    record.setdefault("left", [])  # values changed after an install: the user's from then on
+    # Values the user changed after an install are theirs from then on, until they're put back to what
+    # they were before the first install (say, by restoring a backup): then they're managed again.
+    record.setdefault("left", [])
+
+    def manage(name, current, original, ours):
+        if name in record["left"]:
+            if current != original:
+                return False
+            record["left"].remove(name)
+            return True
+        if current in (ours, original):
+            return True
+        record["left"].append(name)
+        return False
+
+    # A new file, swapped in: overwriting the binary in place while a hook runs it can leave macOS
+    # killing it on every later run (the kernel keeps the old code signature for that file).
     os.makedirs(os.path.dirname(BIN), exist_ok=True)
-    shutil.copy2(os.path.join(HERE, "build", "auto-handoff"), BIN)
+    shutil.copy2(os.path.join(HERE, "build", "auto-handoff"), BIN + ".new")
+    os.replace(BIN + ".new", BIN)
     remove_hooks(settings)
     hooks = settings.setdefault("hooks", {})
     for event in EVENTS:
@@ -94,32 +112,21 @@ def install(settings):
             record["added_allow"].append(rule)
     models = settings.setdefault("modelSettings", {})
     for model in MODELS:
-        if model in record["left"]:
-            continue
-        if model in record["windows"]:
-            if models.get(model, {}).get("autoCompactWindow") != WINDOW:  # changed since: leave it
-                del record["windows"][model], record["models_existed"][model]
-                record["left"].append(model)
-                continue
-        else:
+        current = models.get(model, {}).get("autoCompactWindow")
+        if model not in record["windows"]:
             record["models_existed"][model] = model in models
-            record["windows"][model] = models.get(model, {}).get("autoCompactWindow")
-        models.setdefault(model, {})["autoCompactWindow"] = WINDOW
+            record["windows"][model] = current
+        if manage(model, current, record["windows"][model], WINDOW):
+            models.setdefault(model, {})["autoCompactWindow"] = WINDOW
     if not models and not record["existed"]["modelSettings"]:
         del settings["modelSettings"]
     for key, value in OFF.items():
-        if key in record["left"]:
-            continue
-        if key in record["settings"]:
-            if settings.get(key) != value:
-                del record["settings"][key]
-                record["left"].append(key)
-                continue
-        else:
-            record["settings"][key] = settings.get(key, ABSENT)
-        settings[key] = value
-    with open(RECORD, "w") as f:
-        json.dump(record, f, indent=2)
+        current = settings.get(key, ABSENT)
+        if key not in record["settings"]:
+            record["settings"][key] = current
+        if manage(key, current, record["settings"][key], value):
+            settings[key] = value
+    return record
 
 
 def uninstall(settings):
@@ -138,7 +145,7 @@ def uninstall(settings):
         models = settings.get("modelSettings", {})
         for model, previous in record["windows"].items():
             entry = models.get(model)
-            if entry is None or entry.get("autoCompactWindow") != WINDOW:
+            if entry is None or entry.get("autoCompactWindow") != WINDOW or model in record.get("left", []):
                 continue  # changed since install: leave it
             if previous is None:
                 del entry["autoCompactWindow"]
@@ -149,15 +156,13 @@ def uninstall(settings):
         if "modelSettings" in settings and not models and not record["existed"]["modelSettings"]:
             del settings["modelSettings"]
         for key, previous in record["settings"].items():
-            if settings.get(key) != OFF[key]:
+            if settings.get(key) != OFF[key] or key in record.get("left", []):
                 continue
             if previous == ABSENT:
                 del settings[key]
             else:
                 settings[key] = previous
-    for p in (BIN, RECORD):
-        if os.path.exists(p):
-            os.remove(p)
+    return None
 
 
 def main():
@@ -180,7 +185,7 @@ def main():
             n += 1
             backup = "%s.bak-auto-handoff-%s-%d" % (SETTINGS, time.strftime("%Y%m%d-%H%M%S"), n)
         shutil.copy2(target, backup)
-    (uninstall if removing else install)(settings)
+    record = (uninstall if removing else install)(settings)
     if exists or not removing:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         tmp = target + ".tmp-auto-handoff"
@@ -190,8 +195,19 @@ def main():
         if exists:
             os.chmod(tmp, os.stat(target).st_mode & 0o7777)
         os.replace(tmp, target)
+    # The record goes last, so a failed settings write never leaves one describing changes not made.
+    if removing:
+        for p in (BIN, RECORD):
+            if os.path.exists(p):
+                os.remove(p)
+    else:
+        with open(RECORD, "w") as f:
+            json.dump(record, f, indent=2)
     print("%s.%s" % ("Uninstalled" if removing else "Installed",
                      " Backup of the previous settings: " + backup if backup else ""))
+    if record and record["left"]:
+        print("Left as you set them since installing: %s. Put them back to their values from before the first "
+              "install to have them managed again." % ", ".join(record["left"]))
 
 
 if __name__ == "__main__":

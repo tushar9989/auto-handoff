@@ -113,7 +113,9 @@ def run(name, spec, tmp, run_dir):
     out["log"] = open(log).read() if os.path.exists(log) else ""
     out["work"] = work
     out["archive"] = glob.glob(os.path.join(handoffs, "archive", "*", "*.md"))
-    out["handoffs"] = {os.path.basename(f): open(f).read() for f in glob.glob(os.path.join(handoffs, "*", "*.md"))}
+    out["handoffs"] = {os.path.basename(f): open(f).read() for f in glob.glob(os.path.join(handoffs, "*", "*.md"))
+                       if not f.endswith(".facts.md")}
+    out["facts"] = {os.path.basename(f): open(f).read() for f in glob.glob(os.path.join(handoffs, "*", "*.facts.md"))}
     tdir = glob.glob(os.path.expanduser("~/.claude/projects/*/%s" % out["session"]))
     out["sub_transcripts"] = glob.glob(os.path.join(tdir[0], "subagents", "agent-*.jsonl")) if tdir else []
     main_t = glob.glob(os.path.expanduser("~/.claude/projects/*/%s.jsonl" % out["session"]))
@@ -132,6 +134,19 @@ def summary_lengths(text):
     return sizes
 
 
+def writes_to(text, name):
+    """What a transcript's Write calls put in files named `name`, in order. Slots are removed once
+    their handoff is loaded, so this is where the written handoffs are seen afterwards."""
+    found = []
+    for line in text.splitlines():
+        if '"tool_use"' not in line or name not in line:
+            continue
+        for b in json.loads(line).get("message", {}).get("content", []):
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b["input"].get("file_path", "").endswith("/" + name):
+                found.append(b["input"].get("content", ""))
+    return found
+
+
 def check(name, out):
     log, ok = out["log"], []
 
@@ -143,7 +158,7 @@ def check(name, out):
     expect("released but not compacted" not in log, "every release reached the agent it was meant for")
     if name in ("main", "stop"):
         expect("compaction of main held" in log, "compaction held for main")
-        expect("main.md" in out["handoffs"], "main handoff written")
+        expect(writes_to(out["main_transcript"], "main.md"), "main handoff written")
         expect("compaction of main allowed: handoff" in log, "released by the handoff")
         expect("compacted: 1 handoff(s) to load" in log, "handoff loaded after compaction")
         expect(out["boundaries"] >= 1, "compacted (%d)" % out["boundaries"])
@@ -152,26 +167,27 @@ def check(name, out):
         expect(sizes and max(sizes) < 2000, "short summary (%s chars; about 2,200-3,600 by default)" % sizes)
     if name == "main":
         expect("PostToolUse nudge for main" in log, "nudged mid-turn")
+        facts = out["facts"].get("main.facts.md", "")
+        expect("Read f01.txt through f08.txt" in facts, "facts file holds the user's request word for word")
+        expect("main.facts.md" in out["main_transcript"], "facts file named after compaction")
     if name in ("main", "stop"):
         expect(len(out["archive"]) == 1, "handoff archived (%d)" % len(out["archive"]))
     if name == "project":
         project = os.path.join(os.path.realpath(out["work"]), "docs", "HANDOFF.md")
-        slot = out["handoffs"].get("main.md", "").strip()
+        slot = (writes_to(out["main_transcript"], "main.md") or [""])[-1].strip()
         expect(os.path.realpath(slot) == project if slot.startswith("/") else False, "slot points at docs/HANDOFF.md (%r)" % slot[:120])
         expect("PLUM-42" in open(project).read(), "docs/HANDOFF.md updated in place")
         expect("compaction of main allowed: handoff" in log, "released by the slot")
         injected = [l for l in out["main_transcript"].splitlines() if '"hook_additional_context"' in l and "just compacted" in l]
         expect(injected and "PLUM-42" in injected[-1], "project handoff loaded after compaction")
         expect(len(out["archive"]) == 1, "archived, since it's not in git (%d)" % len(out["archive"]))
+        sizes = summary_lengths(out["main_transcript"])
+        expect(sizes and max(sizes) < 2000, "short summary (%s chars)" % sizes)
     if name == "cycles":
-        writes = []
-        for line in out["main_transcript"].splitlines():
-            if '"tool_use"' not in line or "main.md" not in line:
-                continue
-            for b in json.loads(line).get("message", {}).get("content", []):
-                if isinstance(b, dict) and b.get("type") == "tool_use" and b["input"].get("file_path", "").endswith("main.md"):
-                    writes.append(b["input"].get("content", ""))
+        writes = writes_to(out["main_transcript"], "main.md")
         expect(log.count("compacted: 1 handoff(s) to load") >= 2, "compacted twice with a handoff")
+        sizes = summary_lengths(out["main_transcript"])
+        expect(len(sizes) >= 2 and max(sizes) < 2000, "short summaries, the second one too (%s chars)" % sizes)
         expect(len(writes) >= 2, "%d handoff writes" % len(writes))
         if len(writes) >= 2:
             first_body = "\n".join(writes[0].splitlines()[1:]).strip()
@@ -180,15 +196,19 @@ def check(name, out):
     if name == "stop":
         expect("Stop held for main's handoff" in log, "Stop hook asked for the handoff")
     if name in ("parallel", "modelsettings"):
-        subs = [f for f in out["handoffs"] if f != "main.md"]
+        subs = {}
+        for t in out["sub_transcripts"]:
+            agent = os.path.basename(t)[len("agent-"):-len(".jsonl")]
+            written = writes_to(open(t).read(), agent + ".md")
+            if written:
+                subs[agent] = written[-1]
         want = 2 if name == "parallel" else 1
-        expect(len(subs) == want, "%d subagent handoff(s) written: %s" % (want, subs))
-        for f in subs:
-            agent = f[:-3]
+        expect(len(subs) == want, "%d subagent handoff(s) written: %s" % (want, sorted(subs)))
+        for agent, handoff in subs.items():
             expect("compaction of %s allowed: handoff" % agent in log, "%s released by its handoff" % agent[:8])
             t = [x for x in out["sub_transcripts"] if x.endswith("agent-%s.jsonl" % agent)]
             text = open(t[0]).read() if t else ""
-            own = out["handoffs"][f].splitlines()[0]
+            own = handoff.strip().splitlines()[0]
             expect("just compacted" in text and json.dumps(own)[1:-1] in text, "%s got its own handoff back" % agent[:8])
             sizes = summary_lengths(text)
             expect(sizes and max(sizes) < 2000, "%s short summary (%s chars)" % (agent[:8], sizes))

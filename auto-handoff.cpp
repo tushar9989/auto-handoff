@@ -4,7 +4,8 @@
 // Every hook event runs this one binary (see README.md for the flow). Per-session state lives in
 // ~/.local/state/claude-handoffs/<session_id>/: a <agent>.md slot per agent ("main", or a subagent's
 // agent_id), state.json, events/<agent> (its mtime is that agent's last activity), types/<agent>
-// ("<agent_type>\t<rw|ro>") and paths/<agent> (where that subagent's transcript is).
+// ("<agent_type>\t<rw|ro>\t<window>"), paths/<agent> (where that subagent's transcript is) and mode
+// (the main session's permission mode).
 //
 // Writing the slot is the signal that the handoff is ready. The slot holds the handoff itself, or the
 // path of a handoff file the session already keeps (say a HANDOFF.md in the project), which stays
@@ -22,6 +23,8 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <spawn.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -51,6 +54,9 @@ const double kWindowShare = 0.9;           // never hold past this share of the 
 const double kTriggerGap = 33000;          // auto-compact fires about this far below its window
 const double kTriggerSlack = 50000;        // an agent further below its trigger than this isn't compacting
 const double kMinRoom = 40000;             // hold only where the safety limit is this far above the trigger
+const double kTightSlack = 20000;          // a small-window agent this close to its trigger is never blocked
+const double kStandInSlack = 10000;        // an agent this close to its trigger may be the one compacting
+const double kDeferSeconds = 120;          // a compaction held to check who's compacting goes through next time
 const double kAttributeSeconds = 2;        // PreCompact follows the compacting agent's tool call within this
 const int kSubagentMaxHolds = 12;          // a subagent held this often compacts without a handoff
 const double kReadySeconds = 600;          // a handoff this much older than its compaction is stale
@@ -62,6 +68,11 @@ const double kIdleSeconds = 20 * 60;       // a compaction this long after the l
 const double kClearLinkSeconds = 120;      // SessionEnd(clear) and the new session's start are this close
 const double kKeepDays = 14;
 const long kTranscriptTail = 4 << 20;      // bytes of transcript searched for the latest usage
+const long kTranscriptDeep = 32 << 20;     // searched instead when the tail has none (say, many images)
+const int kFactMessages = 3;               // latest messages to an agent kept word for word in its facts file
+const size_t kFactMessageCap = 4000;       // characters kept of each
+const size_t kFactGitCap = 12000;          // bytes kept of each git listing
+const double kGitSeconds = 2;              // a git command taking longer is skipped
 
 // Families with a native 1M window (from 2.1.302's model table); anything else is assumed 200k.
 const char* kMillionWindow[] = {"claude-opus-5",   "claude-sonnet-5", "claude-haiku-5-5", "claude-fable-5",
@@ -167,13 +178,13 @@ const char* kMissed =
 // and verified live). With a handoff about to be loaded, the full summary is redundant: keep it short.
 // The summarizer checks whose handoff it is, because the hook can't be sure who is compacting. It
 // can't look for the handoff being written: that's in the recent stretch Claude Code keeps word for
-// word, which the summarizer doesn't see. But each agent is told its own path when it starts.
+// word, which the summarizer doesn't see. But each agent is told its own slot when it starts, when
+// it's asked for a handoff, and after each compaction, and no other agent is.
 const char* kSummaryInstructions =
-    "If this conversation shows the agent being told to write its handoff to {path}, that handoff will be "
-    "loaded right after this summary as the main record of the work. In that case keep the summary under "
-    "100 words: the user's latest request in their own words, and anything still open; skip the usual "
-    "sections. If the conversation never names that path, ignore this note and write the full summary as "
-    "usual.";
+    "If this conversation names {path} as the agent's own handoff slot, that handoff will be loaded right "
+    "after this summary as the main record of the work. In that case keep the summary under 100 words: "
+    "the user's latest request in their own words, and anything still open; skip the usual sections. If "
+    "the conversation never names that path, ignore this note and write the full summary as usual.";
 
 struct Config {
   std::string root, log, config_dir, settings;
@@ -705,8 +716,11 @@ bool handoff_like(const std::string& p) {
 }
 
 // The slot's text when it is a path rather than a handoff: one line naming a .md, .markdown or .txt
-// file, without the quotes or backticks it may have been written with. Empty otherwise.
+// file, without the quotes or backticks it may have been written with. Empty otherwise. Only the main
+// session's slot can point: a subagent's slot is always its own handoff, so a subagent is never asked
+// to prune a project file it may share with others.
 std::string pointer(const std::string& d, const std::string& agent) {
+  if (agent != "main") return "";
   std::string text;
   read_file(slot_path(d, agent), text, -1, 4096);
   text = trim(text);
@@ -772,6 +786,50 @@ int git(const std::string& dir, const std::vector<std::string>& args) {
   int status = 0;
   if (rc != 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) return -1;
   return WEXITSTATUS(status);
+}
+
+// What a git command in `dir` prints, up to `cap` bytes (the rest is read and dropped). Empty if it
+// fails or takes longer than kGitSeconds, when it's stopped.
+std::string git_text(const std::string& dir, const std::vector<std::string>& args, size_t cap) {
+  std::vector<std::string> all = {"git", "--no-optional-locks", "-C", dir};
+  all.insert(all.end(), args.begin(), args.end());
+  std::vector<char*> argv;
+  for (auto& a : all) argv.push_back(&a[0]);
+  argv.push_back(nullptr);
+  int fds[2];
+  if (pipe(fds) != 0) return "";
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+  posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
+  posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+  posix_spawn_file_actions_addclose(&fa, fds[0]);
+  posix_spawn_file_actions_addclose(&fa, fds[1]);
+  pid_t pid;
+  int rc = posix_spawnp(&pid, "git", &fa, nullptr, argv.data(), environ);
+  posix_spawn_file_actions_destroy(&fa);
+  close(fds[1]);
+  std::string out;
+  if (rc == 0) {
+    double deadline = now() + kGitSeconds;
+    char buf[8192];
+    while (true) {
+      double left = deadline - now();
+      if (left <= 0) {
+        kill(pid, SIGKILL);
+        break;
+      }
+      pollfd pfd = {fds[0], POLLIN, 0};
+      if (poll(&pfd, 1, int(left * 1000) + 1) <= 0) continue;
+      ssize_t n = read(fds[0], buf, sizeof buf);
+      if (n <= 0) break;
+      if (out.size() < cap) out.append(buf, std::min(size_t(n), cap - out.size()));
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) out.clear();
+  }
+  close(fds[0]);
+  return out;
 }
 
 // In git and unchanged since the last commit: git history already holds this version.
@@ -840,15 +898,48 @@ AgentInfo agent_info(const std::string& d, const std::string& agent) {
   return info;
 }
 
-// A token count as Claude Code reads one: "333000", "333k" or "1m". 0 when it isn't one.
-double tokens_value(const std::string& s) {
-  char* end = nullptr;
-  double v = strtod(s.c_str(), &end);
-  std::string unit = lower(trim(end ? end : ""));
-  if (unit == "k") v *= 1e3;
-  else if (unit == "m") v *= 1e6;
-  else if (!unit.empty()) return 0;
-  return v > 0 ? std::floor(v) : 0;
+bool skip_digits(const std::string& s, size_t& k) {
+  size_t from = k;
+  while (k < s.size() && isdigit(static_cast<unsigned char>(s[k]))) ++k;
+  return k > from;
+}
+
+// A number the way 2.1.302 reads the env var and agent files: an integer, scientific notation ("1e6"),
+// or digits grouped by one separator ("333,000"); anything else is read up to its first non-digit, so
+// "333k" is 333 (only /autocompact understands k and m). -1 when it isn't a positive integer.
+double claude_number(const std::string& raw) {
+  std::string s = trim(raw);
+  if (s.empty() || s[0] == '-') return -1;
+  size_t start = s[0] == '+', k = start;
+  if (s.size() <= 32) {
+    bool whole = skip_digits(s, k), frac = false;
+    if (k < s.size() && s[k] == '.') frac = skip_digits(s, ++k);
+    if ((whole || frac) && k < s.size() && (s[k] == 'e' || s[k] == 'E')) {
+      if (++k < s.size() && (s[k] == '+' || s[k] == '-')) ++k;
+      if (skip_digits(s, k) && k == s.size()) {
+        double v = strtod(s.c_str() + start, nullptr);
+        return v > 0 && v == std::floor(v) ? v : -1;
+      }
+    }
+    k = start;
+    skip_digits(s, k);
+    if (k - start >= 1 && k - start <= 3 && k < s.size() && strchr("_, ", s[k])) {
+      char sep = s[k];
+      std::string plain = s.substr(start, k - start);
+      bool grouped = true;
+      while (grouped && k < s.size()) {
+        size_t group = k + 1;
+        k = group;
+        grouped = s[group - 1] == sep && skip_digits(s, k) && k - group == 3;
+        plain += s.substr(group, 3);
+      }
+      if (grouped) return atof(plain.c_str()) > 0 ? atof(plain.c_str()) : -1;
+    }
+  }
+  k = start;
+  if (!skip_digits(s, k)) return -1;
+  double v = atof(s.substr(start, k - start).c_str());
+  return v > 0 ? v : -1;
 }
 
 // A top-level frontmatter value: the rest of its line, or the "- item" lines under it, as one string.
@@ -868,6 +959,7 @@ std::string front_value(const std::string& front, const std::string& key) {
       if (item.empty()) continue;
       if (!strchr(" \t-", lines[j][0])) break;  // the next key
       if (item[0] == '-') value += (value.empty() ? "" : ", ") + trim(item.substr(1));
+      else value += " " + item;  // a value continued on the next line, such as a [...] list
     }
     return value;
   }
@@ -894,8 +986,8 @@ bool lists(const std::string& list, std::initializer_list<const char*> tools) {
   return false;
 }
 
-// What a subagent's definition says: read-only when its tools leave out Write and Edit (memory adds
-// them back), and the auto-compact window it may set for itself.
+// What a subagent's definition says: read-only when its tools leave out both Write and Edit (memory
+// adds them back), and the auto-compact window it may set for itself.
 AgentInfo definition(const std::string& cwd, const std::string& type) {
   AgentInfo info;
   info.type = type;
@@ -911,10 +1003,12 @@ AgentInfo definition(const std::string& cwd, const std::string& type) {
     size_t end = text.find("\n---", 3);
     std::string front = end == std::string::npos ? text.substr(4) : end < 4 ? "" : text.substr(4, end - 4);
     std::string tools = front_value(front, "tools"), denied = front_value(front, "disallowedTools");
-    bool writes = tools.empty() || lists(tools, {"Write", "Edit", "MultiEdit", "*"});
-    if (lists(denied, {"Write"}) && lists(denied, {"Edit"}) && lists(denied, {"MultiEdit"})) writes = false;
+    bool writes = tools.empty() || lists(tools, {"Write", "Edit", "*"});
+    if (lists(denied, {"Write"}) && lists(denied, {"Edit"})) writes = false;
     info.readonly = !writes && front_value(front, "memory").empty();
-    double w = tokens_value(front_value(front, "autoCompactWindow"));
+    std::string raw = front_value(front, "autoCompactWindow");
+    if (raw.size() >= 2 && (raw[0] == '"' || raw[0] == '\'') && raw.back() == raw[0]) raw = raw.substr(1, raw.size() - 2);
+    double w = claude_number(raw);
     if (w >= 1e5 && w <= 1e6) info.window = w;  // Claude Code ignores values outside this range
     return info;
   }
@@ -956,10 +1050,10 @@ bool compact_boundary(const Json& o) { return o.str("type") == "system" && o.str
 // Latest context size and model, from the last real assistant entry in a transcript. API errors and
 // other synthetic entries carry zero usage and are skipped. A compaction after that entry means the
 // context is small now, whatever the entry said: 0 tokens.
-Usage usage(const std::string& transcript, bool main) {
+Usage usage(const std::string& transcript, bool main, long tail = kTranscriptTail) {
   Usage u;
   std::string text;
-  if (transcript.empty() || !read_file(transcript, text, kTranscriptTail)) return u;
+  if (transcript.empty() || !read_file(transcript, text, tail)) return u;
   size_t end = text.size();
   while (end > 0) {
     size_t start = text.rfind('\n', end - 1);
@@ -982,6 +1076,7 @@ Usage usage(const std::string& transcript, bool main) {
     u.model = m->str("model");
     return u;
   }
+  if (tail < kTranscriptDeep && long(text.size()) >= tail) return usage(transcript, main, kTranscriptDeep);
   return u;
 }
 
@@ -1028,11 +1123,11 @@ double window(const std::string& model) {
   return kDefaultWindow;
 }
 
-// The auto-compact window set by CLAUDE_CODE_AUTO_COMPACT_WINDOW, held to the range Claude Code
-// accepts. 0 when it isn't set or isn't a number.
+// The auto-compact window set by CLAUDE_CODE_AUTO_COMPACT_WINDOW, held to 100k–1M as Claude Code
+// holds it. 0 when it isn't set or isn't a number, which Claude Code ignores too.
 double env_window() {
   const char* e = getenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW");
-  double v = e ? tokens_value(e) : 0;
+  double v = e && *e ? claude_number(e) : -1;
   return v > 0 ? std::min(std::max(v, 1e5), 1e6) : 0;
 }
 
@@ -1048,8 +1143,13 @@ double configured_window(const std::string& model) {
     if (read_file(cfg.settings, text)) Parser(text).parse(settings);
   }
   const Json* ms = settings.get("modelSettings");
-  const Json* entry = ms ? ms->get(canonical(model)) : nullptr;
-  if (entry && entry->has("autoCompactWindow")) return entry->num("autoCompactWindow");
+  std::string name = canonical(model);
+  const Json* entry = nullptr;
+  if (ms)
+    for (const auto& f : ms->fields)
+      if (f.second.has("autoCompactWindow") && canonical(f.first) == name && (!entry || f.first == name))
+        entry = &f.second;
+  if (entry) return entry->num("autoCompactWindow");  // "auto" is 0: the model's own window
   return settings.num("autoCompactWindow");
 }
 
@@ -1061,37 +1161,72 @@ double trigger_point(const std::string& model, double agent_window = 0) {
   double t = w - kTriggerGap;
   if (const char* p = getenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")) {
     double pct = atof(p);
-    if (pct > 0 && pct < 100) t = std::min(t, w * pct / 100);
+    if (pct > 0 && pct <= 100) t = std::min(t, std::floor((w - 20000) * pct / 100));
   }
   return t;
 }
 
+bool planning(const std::string& d);
+
+// An agent that may be compacting, and what holding it would mean.
 struct Candidate {
   std::string agent;
   Usage u;
+  AgentInfo info;
+  std::string instead;  // a holdable agent at its own compaction point, which may be the one compacting
+  double trigger = 0, limit = 0;
+  bool at_limit = false;  // past the safety limit: never block
+  bool tight = false;     // its window leaves no room to hold it
+  bool holdable = false;  // could be held for a handoff now
 };
 
-// Who is compacting: the agent active a moment ago whose context is near its compaction point, else
-// the largest context near its point among recently active agents. Empty when no one is near.
-Candidate compacting(const std::string& d, const std::string& transcript, const std::vector<Event>& evs, double t) {
-  auto near = [&](const std::string& agent, Usage& u) {
-    u = usage(transcript_of(d, transcript, agent), agent == "main");
-    return u.tokens > 0 && u.tokens >= trigger_point(u.model, agent_info(d, agent).window) - kTriggerSlack;
+// Who is compacting: the agents active a moment ago whose context is near their compaction point,
+// newest first, else those near it among recently active agents, largest first. Empty when no one is.
+// When the likeliest one can't be held (read-only, planning, a small window, already released) but a
+// holdable one is right at its own compaction point, `instead` names it: the caller holds the attempt
+// once, so the retry shows who it is. Never when blocking might not be safe.
+Candidate compacting(const std::string& d, const std::string& transcript, const std::vector<Event>& evs, double t,
+                     const Json& st) {
+  auto near = [&](const std::string& agent, Candidate& c) {
+    c.agent = agent;
+    c.u = usage(transcript_of(d, transcript, agent), agent == "main");
+    c.info = agent_info(d, agent);
+    double trigger = c.trigger = trigger_point(c.u.model, c.info.window);
+    if (c.u.tokens <= 0 || c.u.tokens < trigger - kTriggerSlack) return false;
+    c.limit = std::min(cfg.ceiling, kWindowShare * window(c.u.model));
+    c.at_limit = c.u.tokens >= c.limit;
+    c.tight = c.limit - trigger < kMinRoom;
+    const Json* a = st.get("agents")->get(agent);
+    c.holdable = !c.info.readonly && !c.tight && !(agent == "main" && planning(d)) && !(a && a->has("released"));
+    return !c.tight || c.u.tokens >= trigger - kTightSlack;  // a small window is only near when really close
   };
+  std::vector<Candidate> found;
   for (const auto& e : evs) {
     if (t - e.t > kAttributeSeconds) break;
-    Usage u;
-    if (near(e.agent, u)) return {e.agent, u};
+    Candidate c;
+    if (near(e.agent, c)) found.push_back(c);
   }
-  Candidate best;
-  std::vector<std::string> pool = {"main"};
-  for (const auto& e : evs)
-    if (e.agent != "main" && t - e.t <= kIdleSeconds) pool.push_back(e.agent);
-  for (const auto& agent : pool) {
-    Usage u;
-    if (near(agent, u) && (best.agent.empty() || u.tokens > best.u.tokens)) best = {agent, u};
+  if (found.empty()) {
+    std::vector<std::string> pool = {"main"};
+    for (const auto& e : evs)
+      if (e.agent != "main" && t - e.t <= kIdleSeconds) pool.push_back(e.agent);
+    for (const auto& agent : pool) {
+      Candidate c;
+      if (near(agent, c)) found.push_back(c);
+    }
+    std::stable_sort(found.begin(), found.end(), [](const Candidate& a, const Candidate& b) { return a.u.tokens > b.u.tokens; });
   }
-  return best;
+  if (found.empty()) return {};
+  for (const auto& c : found)
+    if (c.at_limit || c.tight) return c;
+  Candidate top = found[0];
+  if (!top.holdable)
+    for (const auto& c : found)
+      if (c.holdable && c.u.tokens >= c.trigger - kStandInSlack) {
+        top.instead = c.agent;
+        break;
+      }
+  return top;
 }
 
 // ---- Messages.
@@ -1145,47 +1280,130 @@ std::string session_cwd(const std::string& d, const Json& in) {
   return cwd.empty() ? in.str("cwd") : cwd;
 }
 
+// ---- Facts saved at compaction, for the agent to read if it needs them.
+
+// The latest messages an agent was given, newest last: the user's own (origin "human"), or for a
+// subagent its task and the coordinator's follow-ups. Summaries, tool results and notices are skipped.
+std::vector<std::string> latest_messages(const std::string& transcript, bool main) {
+  std::vector<std::string> found;
+  std::string text;
+  if (transcript.empty() || !read_file(transcript, text, kTranscriptTail)) return found;
+  size_t end = text.size();
+  while (end > 0 && int(found.size()) < kFactMessages) {
+    size_t start = text.rfind('\n', end - 1);
+    start = start == std::string::npos ? 0 : start + 1;
+    std::string line = text.substr(start, end - start);
+    end = start > 0 ? start - 1 : 0;
+    if (line.find("\"type\":\"user\"") == std::string::npos && line.find("\"type\": \"user\"") == std::string::npos)
+      continue;
+    Json o;
+    if (!Parser(line).parse(o) || o.str("type") != "user" || o.truthy("isCompactSummary")) continue;
+    if (main && o.truthy("isSidechain")) continue;
+    const Json* origin = o.get("origin");
+    std::string kind = origin ? origin->str("kind") : "";
+    if (origin ? kind != "human" && kind != "coordinator" : o.truthy("isMeta")) continue;
+    const Json* m = o.get("message");
+    const Json* content = m ? m->get("content") : nullptr;
+    if (!content) continue;
+    std::string said;
+    bool tool_result = false;
+    if (content->type == Json::Str) said = content->s;
+    for (const auto& block : content->items) {
+      if (block.str("type") == "tool_result") tool_result = true;
+      if (block.str("type") == "text") said += (said.empty() ? "" : "\n") + block.str("text");
+    }
+    said = trim(said);
+    if (tool_result || said.empty() || said.compare(0, 14, "<local-command") == 0) continue;
+    if (said.size() > kFactMessageCap) said = said.substr(0, kFactMessageCap) + "\n[... cut here, " + std::to_string(said.size()) + " characters in all]";
+    if (std::find(found.begin(), found.end(), said) == found.end()) found.push_back(said);
+  }
+  std::reverse(found.begin(), found.end());
+  return found;
+}
+
+std::string fenced(const std::string& text, size_t cap) {
+  std::string body = trim(text);
+  if (body.empty()) return "(nothing)\n";
+  return "```text\n" + body + (text.size() >= cap ? "\n[... cut here]" : "") + "\n```\n";
+}
+
+// Writes <agent>.facts.md: the latest messages to the agent word for word, and the git state of the
+// session's folder (no diffs, which can be huge). Returns its path, or "" when there was nothing.
+std::string save_facts(const std::string& d, const std::string& agent, const std::string& owner,
+                       const std::string& transcript, const std::string& cwd) {
+  std::vector<std::string> said = latest_messages(transcript_of(d, transcript, agent), agent == "main");
+  std::string status = cwd.empty() ? "" : git_text(cwd, {"status", "--short", "--branch"}, kFactGitCap);
+  if (said.empty() && status.empty()) return "";
+  std::string out = "# Facts saved when " + owner + " was compacted (" + stamp("%Y-%m-%d %H:%M") +
+                    ")\n\nGathered by the auto-handoff hook from the transcript and git, not written by an agent.\n";
+  if (!said.empty()) {
+    out += std::string("\n## ") + (agent == "main" ? "The user's latest messages" : "The latest messages this agent was given") +
+           ", word for word, newest last\n";
+    for (size_t k = 0; k < said.size(); ++k) out += "\n### " + std::to_string(k + 1) + "\n\n" + said[k] + "\n";
+  }
+  if (!status.empty()) {
+    out += "\n## Git, in " + cwd + "\n\nBranch and changed files (`git status --short --branch`):\n" +
+           fenced(status, kFactGitCap);
+    std::string stat = git_text(cwd, {"diff", "--stat", "HEAD"}, kFactGitCap);
+    if (!trim(stat).empty()) out += "\nChanges against the last commit (`git diff --stat HEAD`):\n" + fenced(stat, kFactGitCap);
+    std::string log = git_text(cwd, {"log", "--oneline", "-5"}, kFactGitCap);
+    if (!trim(log).empty()) out += "\nRecent commits (`git log --oneline -5`):\n" + fenced(log, kFactGitCap);
+  }
+  std::string p = d + "/" + agent + ".facts.md";
+  write_atomic(p, out);
+  return p;
+}
+
 // ---- Handlers.
 
 void prune();
 std::string pickup(const std::string& cwd, const std::string& d_new);
 
+// Archive the handoff unless this version already was (a release that went elsewhere, then another).
+void archive_once(const std::string& d, const std::string& agent, Json& a, const std::string& cwd) {
+  if (a.num("archived") >= mtime(handoff_file(d, agent))) return;
+  archive(d, agent, cwd, "");
+  set(a, "archived", now());
+}
+
 void release(const std::string& d, const std::string& agent, Json& a, const std::string& why, const std::string& cwd) {
   set(a, "released", now());
   a.at("why") = Json::string(why);
   if (why != "handoff") return;
+  archive_once(d, agent, a, cwd);
   std::string file = handoff_file(d, agent);
-  if (a.num("archived") < mtime(file)) {  // not when released again after a release that went elsewhere
-    archive(d, agent, cwd, "");
-    set(a, "archived", now());
-  }
   if (file != slot_path(d, agent)) a.at("file") = Json::string(file);
 }
 
 std::string label(const std::string& d, const std::string& agent) {
-  std::string type = agent_info(d, agent).type;
-  return handoff_file(d, agent) + ", for " +
+  std::string type = agent_info(d, agent).type, file = handoff_file(d, agent), slot = slot_path(d, agent);
+  return file + (file == slot ? "" : " (via " + slot + ")") + ", for " +
          (agent == "main" ? "the main session" : "a subagent" + (type.empty() ? "" : " (" + type + ")"));
 }
 
 // Runs inside the context that was just compacted, whichever agent that is.
-void after_compact(const std::string& d) {
+void after_compact(const Json& in, const std::string& d) {
   struct Handoff {
     std::string label, text, note;
   };
   std::vector<Handoff> handoffs;
   std::vector<std::string> waiting;  // ready but not released: listed in case one of them is compacting
+  std::vector<std::pair<std::string, std::string>> released;  // agent, owner: their facts are saved below
+  std::string cwd;
   bool forced = false;
   {
     Lock lock(d);
     Json st = load_state(d);
     set(st, "last_compact", now());
+    cwd = st.str("cwd").empty() ? in.str("cwd") : st.str("cwd");
     for (const auto& f : st.get("agents")->fields) {
       const Json& a = f.second;
       if (!a.has("released")) {
         if (a.has("pending") && slot_ready(d, f.first, a.num("pending"))) waiting.push_back(label(d, f.first));
         continue;
       }
+      std::string type = agent_info(d, f.first).type;
+      released.emplace_back(f.first, f.first == "main" ? "the main session" : "a subagent" + (type.empty() ? "" : " (" + type + ")"));
       std::string why = a.str("why");
       if (why == "limit") forced = true;
       if (why != "handoff") continue;
@@ -1199,11 +1417,22 @@ void after_compact(const std::string& d) {
   }
   log(d, "compacted: " + std::to_string(handoffs.size()) + " handoff(s) to load" +
              (forced ? ", one at the safety limit" : ""));
+  // Kept out of the context on purpose: a git status can be long. One line says where they are.
+  std::vector<std::string> facts;
+  for (const auto& r : released) {
+    std::string p = save_facts(d, r.first, r.second, in.str("transcript_path"), cwd);
+    if (!p.empty()) facts.push_back(p + (released.size() > 1 ? " (for " + r.second + ")" : ""));
+  }
   std::string text = kUserNote, others;
   if (!waiting.empty()) {
     others = "\n\n[auto-handoff] These handoffs are ready but weren't loaded here. If one of them is yours, read "
              "it before going on:";
     for (const auto& w : waiting) others += "\n- " + w;
+  }
+  if (!facts.empty()) {
+    others += "\n\n[auto-handoff] Saved at compaction, in case you need them: the latest messages to you word for "
+              "word, and the git status. Read " + std::string(facts.size() > 1 ? "yours: " : "it at ");
+    for (size_t k = 0; k < facts.size(); ++k) others += (k ? "; " : "") + facts[k];
   }
   if (handoffs.empty()) {
     if (forced)
@@ -1234,7 +1463,7 @@ void after_compact(const std::string& d) {
 
 void on_session_start(const Json& in, const std::string& d) {
   std::string src = in.str("source");
-  if (src == "compact") return after_compact(d);
+  if (src == "compact") return after_compact(in, d);
   {
     Lock lock(d);
     Json st = load_state(d);
@@ -1299,6 +1528,9 @@ bool settle_if_compacted(const std::string& d, const Json& in, const std::string
   std::string transcript = transcript_of(d, in.str("transcript_path"), agent);
   if (a.has("released")) {  // its first activity since: was it the one compacted?
     if (transcript.empty() || mtime(transcript) < 0 || compacted_since(transcript, a.num("released"))) {
+      // Loaded and archived: remove the slot, so the next handoff is a new file. The Write tool won't
+      // overwrite a file the agent hasn't read in this context.
+      if (a.str("why") == "handoff") unlink(slot_path(d, agent).c_str());
       settle(a);
       return true;
     }
@@ -1313,11 +1545,15 @@ bool settle_if_compacted(const std::string& d, const Json& in, const std::string
   log(d, agent + " was compacted without its handoff being released; no longer waiting");
   if (slot_ready(d, agent, a.num("pending"))) {
     missed = handoff_file(d, agent);
-    archive(d, agent, session_cwd(d, in), "");
+    archive_once(d, agent, a, session_cwd(d, in));
   }
   settle(a);
+  if (!missed.empty()) a.at("missed") = Json::string(missed);  // said at its next event that can reply
   return true;
 }
+
+// Whether an agent has anything going on: waiting, just released, or owed a message.
+bool busy(const Json* a) { return a && (a->has("pending") || a->has("released") || a->has("missed")); }
 
 // Tool results, failures, denials and new prompts: note who is active, and remind an agent that is
 // holding up its own compaction (only where the event can carry context back to it).
@@ -1326,8 +1562,7 @@ void on_activity(const Json& in, const std::string& d, const std::string& agent,
   if (agent == "main") note_mode(d, in.str("permission_mode"));
   {
     Json st = load_state(d);  // most calls end here, without the lock
-    const Json* a = st.get("agents")->get(agent);
-    if (!a || !(a->has("pending") || a->has("released"))) return;
+    if (!busy(st.get("agents")->get(agent))) return;
   }
   std::string text, kind;
   {
@@ -1336,10 +1571,12 @@ void on_activity(const Json& in, const std::string& d, const std::string& agent,
     Json* cur = st.get("agents")->get(agent);
     if (!cur) return;
     std::string missed;
-    if (settle_if_compacted(d, in, agent, st, *cur, missed)) {
+    settle_if_compacted(d, in, agent, st, *cur, missed);
+    if (cur->has("missed") && can_reply) {
+      std::string file = cur->str("missed");
+      cur->erase("missed");
       save_state(d, st);
-      if (!missed.empty() && can_reply) context(ev, replace_all(kMissed, "{file}", missed));
-      return;
+      return context(ev, replace_all(kMissed, "{file}", file));
     }
     if (!cur->has("pending") || cur->has("released") || !can_reply || in.str("permission_mode") == "plan")
       return save_state(d, st);
@@ -1381,23 +1618,24 @@ void on_stop(const Json& in, const std::string& d, const std::string& agent) {
   if (agent == "main") note_mode(d, in.str("permission_mode"));
   {
     Json st = load_state(d);
-    const Json* a = st.get("agents")->get(agent);
-    if (!a || !(a->has("pending") || a->has("released"))) return;
+    if (!busy(st.get("agents")->get(agent))) return;
   }
   Json a;
   std::string missed;
+  bool quiet = in.truthy("stop_hook_active") || in.str("permission_mode") == "plan";
   {
     Lock lock(d);
     Json st = load_state(d);
     Json* cur = st.get("agents")->get(agent);
     if (!cur) return;
-    bool settled = settle_if_compacted(d, in, agent, st, *cur, missed);
+    settle_if_compacted(d, in, agent, st, *cur, missed);
+    missed = quiet ? "" : cur->str("missed");
+    if (!missed.empty()) cur->erase("missed");
     a = *cur;
     save_state(d, st);
-    if (settled && missed.empty()) return;
   }
-  if (in.truthy("stop_hook_active") || in.str("permission_mode") == "plan") return;
   if (!missed.empty()) return block(replace_all(kMissed, "{file}", missed));
+  if (quiet) return;
   if (!a.has("pending") || a.has("released")) return;
   if (slot_ready(d, agent, a.num("pending"))) {
     if (!needs_trim(d, agent, a)) return;
@@ -1429,15 +1667,29 @@ void on_pre_compact(const Json& in, const std::string& d) {
 
   std::vector<Event> evs = events(d);
   bool idle = evs.empty() || t - evs[0].t > kIdleSeconds;
-  Candidate c = compacting(d, in.str("transcript_path"), evs, t);
+  Candidate c = compacting(d, in.str("transcript_path"), evs, t, load_state(d));
   if (c.agent.empty()) return log(d, "compaction allowed: no agent is near its compaction point");
   std::string who = c.agent;
-  AgentInfo info = agent_info(d, who);
-  double limit = std::min(cfg.ceiling, kWindowShare * window(c.u.model));
-  bool at_limit = c.u.tokens >= limit;
+  double limit = c.limit;
+  bool at_limit = c.at_limit;
 
   Lock lock(d);
   Json st = load_state(d);
+  // `who` can't be held, but `instead` may be the one compacting: hold this attempt once. If it's
+  // `instead`, its retry follows its own tool call, which makes it the clear pick; if `who` is the
+  // likeliest again, it goes through then. Neither agent's state changes, so no hold is counted.
+  const Json* deferred = st.get("deferred");
+  bool again = deferred && deferred->str("agent") == who && t - deferred->num("at") < kDeferSeconds;
+  if (!c.instead.empty() && !again) {
+    Json mark = Json::object();
+    mark.at("agent") = Json::string(who);
+    set(mark, "at", t);
+    st.at("deferred") = mark;
+    save_state(d, st);
+    log(d, "compaction held once: " + who + " can't be held, and " + c.instead + " is at its own compaction point");
+    return block("auto-handoff: checking which agent is compacting");
+  }
+  if (deferred && deferred->str("agent") == who) st.erase("deferred");
   Json& a = st.get("agents")->at(who);
   std::string cwd = st.str("cwd").empty() ? in.str("cwd") : st.str("cwd"), slot = slot_path(d, who);
   if (a.has("released")) {  // another attempt for the same compaction
@@ -1467,18 +1719,19 @@ void on_pre_compact(const Json& in, const std::string& d) {
       save_state(d, st);
       return block("auto-handoff: waiting for the handoff to be trimmed");
     }
+    bool unfinished = trimming && a.has("trim");  // over the cap but never asked to trim: complete, just long
     release(d, who, a, "handoff", cwd);
-    if (trimming) set(a, "unfinished", t);
-    log(d, "compaction of " + who + " allowed: handoff" + (trimming ? ", trim unfinished at the safety limit" : ""));
+    if (unfinished) set(a, "unfinished", t);
+    log(d, "compaction of " + who + " allowed: handoff" + (unfinished ? ", trim unfinished at the safety limit" : ""));
     save_state(d, st);
-    if (!trimming) emit(summary_instructions(d, who));  // otherwise the full summary, as a fallback
+    if (!unfinished) emit(summary_instructions(d, who));  // otherwise the full summary, as a fallback
     return;
   }
   // Agents that couldn't write a handoff, or have no room to: compact as usual.
-  std::string skip = info.readonly                                     ? "read-only agent"
-                     : who == "main" && planning(d)                    ? "plan mode"
-                     : limit - trigger_point(c.u.model, info.window) < kMinRoom ? "window too small to hold"
-                                                                       : "";
+  std::string skip = c.info.readonly                  ? "read-only agent"
+                     : c.tight                        ? "window too small to hold"
+                     : who == "main" && planning(d)   ? "plan mode"
+                                                      : "";
   if (!skip.empty()) {
     release(d, who, a, "skipped", cwd);
     log(d, "compaction of " + who + " allowed: " + skip);
@@ -1517,11 +1770,12 @@ std::string pickup(const std::string& cwd, const std::string& d_new) {
   double since = a ? (a->has("pending") ? a->num("pending") : a->num("compacted")) : 0;
   if (!slot_ready(d, "main", since)) return "";
   std::string p = handoff_file(d, "main"), text = read_handoff(p);
-  archive(d, "main", cwd, "");
   {
     Lock lock(d);
     Json cur = load_state(d);
-    settle(cur.get("agents")->at("main"));
+    Json& m = cur.get("agents")->at("main");
+    archive_once(d, "main", m, cwd);
+    settle(m);
     save_state(d, cur);
   }
   std::string head = std::string(kUserNote) + "\n\n[auto-handoff] ";

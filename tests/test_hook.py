@@ -155,6 +155,7 @@ class HookTest(unittest.TestCase):
         self.assertIn("Next: run the tests", injected)
         self.tool()
         self.assertEqual(list(self.agents()["main"]), ["compacted"])
+        self.assertFalse(os.path.exists(os.path.join(self.d, "main.md")))  # archived; the next one is a new file
         # The next cycle needs a new handoff: the old one is spent.
         self.tokens("main", 300_000)
         self.hold()
@@ -225,7 +226,9 @@ class HookTest(unittest.TestCase):
     def test_manual_compact(self):
         self.tool()
         self.assertIsNone(self.compact("manual"))
-        self.assertEqual(self.returned(), NOTE)  # nothing to load, but the note still comes
+        back = self.returned()
+        self.assertTrue(back.startswith(NOTE))  # nothing to load, but the note still comes
+        self.assertNotIn("just compacted", back)
         self.tool()
         self.write_handoff("main", "Owner: main session - manual one")
         self.assertTrue(self.shortens_summary(self.compact("manual")))
@@ -370,7 +373,7 @@ class HookTest(unittest.TestCase):
         self.tool("sub")
         out = self.compact()
         # The summarizer only shortens the summary if it sees this handoff being written.
-        self.assertIn("told to write its handoff to " + os.path.join(self.d, "sub.md"),
+        self.assertIn("If this conversation names " + os.path.join(self.d, "sub.md"),
                       out["text"])
         injected = self.returned("main")
         self.assertIn("SUB TASK", injected)
@@ -385,6 +388,110 @@ class HookTest(unittest.TestCase):
         self.assertTrue(self.shortens_summary(self.compact()))
         self.assertIn("SUB TASK", self.returned("sub"))
         self.assertEqual(len([f for f in self.archived() if f.endswith("_sub.md")]), 1)  # archived once
+        self.assertEqual(len([f for f in self.archived() if f.endswith("_main.md")]), 1)
+
+    def explore(self, agent, tokens):
+        self.tokens(agent, tokens)
+        self.run_hook("SubagentStart", agent, agent_type="Explore")
+
+    def test_agent_that_cant_be_held_doesnt_let_another_through(self):
+        self.tokens("main", 301_000)
+        self.explore("exp", 280_000)
+        self.tool()
+        self.tool("exp")  # the read-only agent acts last, but main is at its compaction point too
+        self.assertTrue(self.blocked(self.compact()))  # held once to see who retries
+        self.assertNotIn("main", self.agents())  # nothing recorded, no hold counted
+        self.tool()  # it was main: its retry follows its own tool call
+        self.assertTrue(self.blocked(self.compact()))
+        self.assertIn("pending", self.agents()["main"])
+        self.assertNotIn("exp", self.agents())
+
+    def test_agent_that_cant_be_held_is_held_only_once(self):
+        self.tokens("main", 301_000)
+        self.explore("exp", 280_000)
+        self.tool()
+        self.tool("exp")
+        self.assertTrue(self.blocked(self.compact()))
+        self.tool("exp")  # it was the read-only agent: it's the likeliest again, so it goes through
+        self.assertFalse(self.blocked(self.compact()))
+        self.assertNotIn("main", self.agents())
+
+    def test_agent_not_at_its_point_is_no_stand_in(self):
+        self.tokens("main", 275_000)  # near its 300k point, but not at it
+        self.explore("exp", 301_000)
+        self.tool()
+        self.tool("exp")
+        self.assertFalse(self.blocked(self.compact()))
+
+    def test_alone_an_agent_that_cant_be_held_goes_through(self):
+        self.tokens("main", 50_000)
+        self.explore("exp", 280_000)
+        self.tool("exp")
+        self.assertFalse(self.blocked(self.compact()))
+
+    def test_released_agent_doesnt_let_another_through(self):
+        self.tokens("main", 50_000)
+        self.tokens("A", 305_000)
+        self.tokens("B", 302_000)
+        self.hold("A")
+        self.write_handoff("A", "Owner: subagent A")
+        self.tool("B")
+        self.tool("A")
+        self.assertTrue(self.shortens_summary(self.compact()))  # A released, and being summarized
+        self.assertTrue(self.blocked(self.compact()))  # B's attempt, with A's event still the newest
+        self.tool("B")  # B's retry follows its own tool call
+        self.assertTrue(self.blocked(self.compact()))
+        self.assertIn("pending", self.agents()["B"])
+
+    def test_small_window_agent_near_its_trigger_is_never_blocked(self):
+        self.tokens("main", 301_000)
+        self.tokens("h", 160_000, model="claude-haiku-4-5")  # 167k trigger: it may be the one compacting
+        self.tool()
+        self.tool("h")
+        self.assertFalse(self.blocked(self.compact()))
+
+    def test_small_window_agent_far_from_its_trigger_is_ignored(self):
+        self.tokens("main", 301_000)
+        self.tokens("h", 120_000, model="claude-haiku-4-5")
+        self.tool()
+        self.tool("h")
+        self.assertTrue(self.blocked(self.compact()))
+        self.assertIn("pending", self.agents()["main"])
+
+    def test_agent_at_its_limit_always_goes_through(self):
+        self.tokens("main", 460_000)
+        self.tokens("A", 300_000)
+        self.tool()
+        self.tool("A")
+        self.assertFalse(self.blocked(self.compact()))
+
+    def test_missed_handoff_waits_for_an_event_that_can_reply(self):
+        self.hold()
+        self.write_handoff("main", "Owner: main session - MINE")
+        self.returned("main")  # compacted, but its handoff wasn't released
+        self.assertIsNone(self.run_hook("PostToolUseFailure", tool_name="Bash", error="x"))
+        self.assertIn("read " + os.path.join(self.d, "main.md"), self.ctx(self.tool()))
+        self.assertEqual(self.ctx(self.tool()), "")  # said once
+        self.assertEqual(len(self.archived()), 1)
+
+    def test_usage_is_found_past_large_images(self):
+        with open(self.transcript, "a") as f:
+            for _ in range(8):  # image tool results after the last response, 650KB each
+                f.write(json.dumps({"type": "user", "message": {"content": [{"type": "image", "data": "A" * 650_000}]}}) + "\n")
+        self.hold()
+        self.assertEqual(self.agents()["main"]["tokens"], 300_000)
+
+    def test_subagent_slot_never_points_at_a_file(self):
+        handoff = self.project_handoff("# Shared handoff\n" + "z" * 20_000)
+        self.tokens("main", 50_000)
+        self.tokens("agentA", 300_000)
+        self.hold("agentA")
+        self.write_handoff("agentA", handoff)  # a path: taken as its handoff text, the file isn't touched
+        self.tool("agentA")
+        self.assertTrue(self.shortens_summary(self.compact()))
+        injected = self.returned("agentA")
+        self.assertIn(handoff, injected)
+        self.assertNotIn("zzzz", injected)
 
     def test_agent_just_compacted_is_not_blamed(self):
         # Until its next request, a compacted agent's transcript still shows its old size.
@@ -415,12 +522,12 @@ class HookTest(unittest.TestCase):
         self.tokens("main", 170_000, model="claude-haiku-4-5")
         self.tool()
         self.assertFalse(self.blocked(self.compact()))
-        self.assertEqual(self.returned(), NOTE)
+        self.assertNotIn("just compacted", self.returned())
 
     def test_agent_definition_sets_its_own_window(self):
         os.makedirs(os.path.join(self.config, "agents"))
         with open(os.path.join(self.config, "agents", "scout.md"), "w") as f:
-            f.write("---\nname: scout\nautoCompactWindow: 200k\n---\n")
+            f.write("---\nname: scout\nautoCompactWindow: '200000'\n---\n")  # YAML quotes are fine
         self.tokens("main", 50_000)
         self.tokens("s", 160_000)  # near its own 167k trigger, far below the session's 300k
         self.run_hook("SubagentStart", "s", agent_type="scout")
@@ -446,12 +553,19 @@ class HookTest(unittest.TestCase):
             self.tool()
             return self.blocked(self.compact())
         ms = lambda key, w: {"modelSettings": {key: {"autoCompactWindow": w}}}
-        self.assertTrue(held(300_000, "claude-opus-5-5", {}, window="333k"))
-        self.assertFalse(held(240_000, "claude-opus-5-5", {}, window="333k"))  # 333k, not 333
+        self.assertTrue(held(300_000, "claude-opus-5-5", {}, window="333000"))
+        self.assertFalse(held(240_000, "claude-opus-5-5", {}, window="333,000"))  # grouped digits count
+        self.assertTrue(held(300_000, "claude-opus-5-5", {}, window="333,000"))
+        self.assertTrue(held(20_000, "claude-opus-5-5", {}, window="333k"))  # Claude Code reads 333: a 100k window
         self.assertFalse(held(10_000, "claude-opus-5-5", {}, window="50000"))  # raised to 100k, as Claude Code does
+        self.assertFalse(held(300_000, "claude-opus-5-5", {}, window="lots"))  # ignored: the 1M window
         self.assertTrue(held(300_000, "claude-opus-5-5-20260815", ms("claude-opus-5-5", 333000)))
         self.assertTrue(held(300_000, "us.anthropic.claude-opus-5-5-v1:0", ms("claude-opus-5-5", 333000)))
         self.assertFalse(held(300_000, "claude-opus-5-5", ms("claude-opus-5", 333000)))  # another model's key
+        self.assertTrue(held(300_000, "claude-opus-5-5", ms("claude-opus-5-5[1m]", 333000)))  # keys are normalised too
+        both = {"modelSettings": {"claude-opus-5-5[1m]": {"autoCompactWindow": 1000000},
+                                  "claude-opus-5-5": {"autoCompactWindow": 333000}}}
+        self.assertTrue(held(300_000, "claude-opus-5-5", both))  # the canonical key wins
         auto = {"autoCompactWindow": 333000, "modelSettings": {"claude-opus-5-5": {"autoCompactWindow": "auto"}}}
         self.assertFalse(held(300_000, "claude-opus-5-5", auto))  # "auto": the model's own 1M window
 
@@ -474,6 +588,9 @@ class HookTest(unittest.TestCase):
             "---\nname: a\ndescription: |\n  tools: Write and Edit\ntools: Read\n---\n": "ro",
             "---\nname: a\n---\ntools: Read\n": "rw",
             "---\nname: a\ntools: Read, Write(docs/**)\n---\n": "rw",
+            "---\nname: a\ntools: [Read, Grep,\n  Write]\n---\n": "rw",
+            "---\nname: a\ndisallowedTools: Write, Edit\n---\n": "ro",
+            "---\nname: a\ntools: Read, MultiEdit\n---\n": "ro",
         }
         os.makedirs(os.path.join(self.config, "agents"))
         for n, (text, want) in enumerate(cases.items()):
@@ -492,7 +609,7 @@ class HookTest(unittest.TestCase):
         self.assertIsNone(self.run_hook("SubagentStart", "rev", agent_type="art-reviewer"))  # no handoff path
         self.tool("rev")
         self.assertFalse(self.blocked(self.compact()))
-        self.assertEqual(self.returned(), NOTE)
+        self.assertNotIn("just compacted", self.returned())
         self.assertEqual(self.ctx(self.tool("rev")), "")
 
     def test_explore_is_read_only(self):
@@ -570,6 +687,16 @@ class HookTest(unittest.TestCase):
         self.assertIn("still being pruned", injected)
         self.assertIn("_before-trim.md", injected)  # where the full version is
 
+    def test_long_handoff_first_seen_at_the_limit_is_complete(self):
+        self.hold()
+        self.big_handoff()
+        self.tokens("main", 460_000)
+        self.tool()
+        out = self.compact()
+        self.assertFalse(self.blocked(out))
+        self.assertTrue(self.shortens_summary(out))  # complete, just long: no trim was ever started
+        self.assertNotIn("still being pruned", self.returned())
+
     def test_slow_trim_isnt_mistaken_for_a_stale_handoff(self):
         self.hold()
         self.big_handoff()
@@ -605,7 +732,7 @@ class HookTest(unittest.TestCase):
         self.assertTrue(self.shortens_summary(self.compact()))
         injected = self.returned()
         self.assertIn("RESUME HERE: beard A", injected)
-        self.assertIn(handoff, injected)
+        self.assertIn(handoff + " (via " + os.path.join(self.d, "main.md") + ")", injected)  # names the slot
         self.assertEqual(len(self.archived()), 1)  # not in git, so archived
         self.tool()
         self.tokens("main", 300_000)
@@ -707,6 +834,71 @@ class HookTest(unittest.TestCase):
         os.utime(os.path.join(self.root, "archive"), (0, 0))
         self.run_hook("SessionStart", source="startup")  # pruning leaves the archive alone
         self.assertEqual(len(self.archived()), 1)
+
+    # ---- facts saved at compaction
+
+    def said(self, agent, text, **extra):
+        entry = {"type": "user", "message": {"role": "user", "content": text}}
+        entry.update(extra)
+        self.append(agent, entry)
+
+    def test_facts_are_saved_beside_the_handoff_not_in_it(self):
+        repo = os.path.dirname(os.path.dirname(self.project_handoff("# x\n", git=True)))
+        for n in range(300):  # a long status stays in the file
+            with open(os.path.join(repo, "untracked-%03d.txt" % n), "w") as f:
+                f.write("x")
+        self.run_hook("SessionStart", source="startup", cwd=repo)
+        self.said("main", "port the parser, keep the old API", origin={"kind": "human"})
+        self.said("main", "<task-notification>done</task-notification>", origin={"kind": "task-notification"})
+        self.said("main", "a reminder", isMeta=True)
+        self.hold()
+        self.write_handoff("main", "Owner: main session - port")
+        self.tool()
+        self.compact()
+        back = self.returned()
+        facts = os.path.join(self.d, "main.facts.md")
+        self.assertIn("Read it at " + facts, back)
+        self.assertNotIn("untracked-", back)  # the listing is only in the file
+        with open(facts) as f:
+            text = f.read()
+        self.assertIn("port the parser, keep the old API", text)
+        self.assertNotIn("task-notification", text)
+        self.assertNotIn("a reminder", text)
+        self.assertIn("untracked-299.txt", text)
+        self.assertIn("## Git, in " + repo, text)
+        self.assertIn("git log --oneline -5", text)
+
+    def test_facts_keep_the_latest_three_messages_and_cut_long_ones(self):
+        for n in range(5):
+            self.said("main", "request %d" % n, origin={"kind": "human"})
+        self.said("main", "y" * 5000, origin={"kind": "human"})
+        self.tool()
+        self.compact("manual")
+        self.returned()
+        with open(os.path.join(self.d, "main.facts.md")) as f:
+            text = f.read()
+        self.assertNotIn("request 2", text)
+        self.assertIn("request 3", text)
+        self.assertLess(text.index("request 3"), text.index("request 4"))  # newest last
+        self.assertIn("5000 characters in all", text)
+        self.assertNotIn("## Git", text)  # /work isn't a repo
+
+    def test_subagent_facts_hold_its_task(self):
+        self.tokens("main", 50_000)
+        self.tokens("agentA", 300_000)
+        self.said("agentA", "Read f01.txt to f07.txt")  # a subagent's task has no origin
+        self.said("agentA", "Follow-up: also f08.txt", isMeta=True, origin={"kind": "coordinator"})
+        self.run_hook("SubagentStart", "agentA", agent_type="builder")
+        self.hold("agentA")
+        self.write_handoff("agentA", "Owner: subagent")
+        self.tool("agentA")
+        self.compact()
+        self.assertIn("agentA.facts.md", self.returned("agentA"))
+        with open(os.path.join(self.d, "agentA.facts.md")) as f:
+            text = f.read()
+        self.assertIn("The latest messages this agent was given", text)
+        self.assertIn("Read f01.txt to f07.txt", text)
+        self.assertIn("also f08.txt", text)
 
     # ---- /clear
 

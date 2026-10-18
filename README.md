@@ -20,16 +20,19 @@ clean point. The handoff is then loaded into the fresh context automatically.
      session's folder, or wrapped in quotes or backticks. A path the hook can't follow doesn't count
      as written, and the agent is told why.
    - **Main session without one:** the handoff goes in the slot itself.
-   - **Subagents:** they write their own handoff text to their slot. Handoff or progress files their
-     own instructions ask for are kept as usual, separately.
+   - **Subagents:** they write their own handoff text to their slot. A slot of theirs is never
+     followed as a path, so a subagent is never asked to prune a project file it may share. Handoff or
+     progress files their own instructions ask for are kept as usual, separately.
 
    Writing the slot is the "ready" signal, so routine edits to a project handoff don't release
-   compaction. A slot written more than 10 minutes before its compaction comes is treated as stale
+   compaction. Once a handoff has been loaded (and archived), its slot is removed, so the next one is a
+   new file: the Write tool won't overwrite a file the agent hasn't read in its current context. A slot written more than 10 minutes before its compaction comes is treated as stale
    and asked for again.
 4. Once the slot is written, the next attempt goes through. The hook asks Claude Code's summarizer
    for a summary under 100 words, since the handoff carries the details. It asks only if the
-   conversation being summarized shows the agent being told to use that slot; each agent is told its
-   own slot when it starts. Otherwise the summary is the usual full one.
+   conversation being summarized names that slot as the agent's own. Each agent is told its own slot
+   when it starts, when it's asked for a handoff, and after each compaction, and no other agent is
+   told it. Otherwise the summary is the usual full one.
 5. Right after compaction, the hook loads the handoff into the fresh context: inline up to 9.5k
    characters, otherwise as a path to read. Every message that returns from a compaction opens with
    "A note from the user: make no mistakes. I love you.", even when there's nothing to load.
@@ -46,16 +49,33 @@ Claude Code's compaction hooks don't say which agent is compacting, so the hook 
   minutes.
 - If no agent is near its point, it doesn't hold.
 - Agents whose size is unknown, and agents whose transcript shows they were just compacted, are
-  never chosen.
+  never chosen. If the latest response isn't in the transcript's last 4MB (say, after many large
+  images), the hook reads back further.
+- Sometimes the likeliest agent can't be held, while another candidate is within 10k of its own
+  compaction point. Agents that can't be held are read-only agents, the main session in plan mode,
+  agents with a small window, and agents already released. In that case the attempt is held once,
+  without recording anything:
+  - if the other agent is the one compacting, its retry comes right after its own tool call, which
+    makes it the clear pick;
+  - if the first agent is the likeliest again, it goes through.
+
+  So the first agent loses at most one request, and no hold is charged to anyone.
+- An attempt is never blocked when any candidate is past its safety limit, or is a small-window
+  agent within 20k of its compaction point. Blocking either one could make a request fail.
 
 The compaction point is read the way Claude Code reads it:
-- `CLAUDE_CODE_AUTO_COMPACT_WINDOW` comes first. Values like `333k` are understood, and the value
-  is held to 100k–1M.
+- `CLAUDE_CODE_AUTO_COMPACT_WINDOW` comes first, read like Claude Code 2.1.302 reads it:
+  - plain digits work, and so do `333,000` and `1e6`;
+  - `333k` is read as 333;
+  - the value is held to 100k–1M, so `333k` means a 100k window.
+
+  (Only the `/autocompact` command understands `k` and `m`.)
 - Next is the model's own `modelSettings` entry in `~/.claude/settings.json`. It matches by
   canonical name, so dated, `[1m]`, Bedrock and Vertex spellings count; `"auto"` means the model's
   own window.
 - Otherwise the top-level `autoCompactWindow` applies.
-- A subagent definition's own `autoCompactWindow` caps all of these, unless the env var is set.
+- A subagent definition's own `autoCompactWindow` caps all of these, unless the env var is set. It
+  has to be a number from 100000 to 1000000; `200k` is ignored, as Claude Code ignores it.
 - `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is applied last.
 
 The context size is the last response's input plus its output. Workflow agents' transcripts are
@@ -64,26 +84,40 @@ found wherever they live.
 When the pick is wrong, nothing is lost:
 - **The summary stays full.** The summarizer only shortens it when the conversation being compacted
   names that handoff's slot, and no other agent is ever told it.
-- **Every loaded handoff says whose it is** ("the main session", "a subagent (pixel-builder)"). The
-  agent continues from its own and ignores the rest.
+- **Every loaded handoff says whose it is** ("the main session", "a subagent (pixel-builder)"), and
+  names its slot. The agent continues from its own and ignores the rest.
 - **Other ready handoffs are listed.** After compaction, the hook also lists handoffs that are ready
   but weren't released, so the agent that really compacted can find its own.
 - **Agents are checked after a release.** An agent released but not compacted (its transcript shows
   no compaction) goes back to waiting, with its handoff still ready.
 - **Missed handoffs are pointed out.** An agent that was compacted while its handoff wasn't loaded is
-  told where its handoff is at its next step.
+  told where its handoff is at its next step that can carry a message.
+
+### Facts saved at compaction
+
+When an agent's compaction goes through, the hook saves `<session>/<agent>.facts.md`. Nobody writes
+it; the hook gathers it:
+- the last three messages to the agent, word for word (yours for the main session; the task and the
+  main session's follow-ups for a subagent), each cut at 4,000 characters;
+- the branch and changed files (`git status --short --branch`);
+- a per-file change summary (`git diff --stat HEAD`), and the last five commits.
+
+Diffs are left out, since they can be huge, and each git listing is cut at 12KB. The returning agent
+gets one line saying where the file is, and reads it only if it needs to. A git command taking over
+2 seconds is skipped.
 
 ### Subagents
 
 - **Read-only agents are never held**, since they couldn't write a handoff anyway; they compact
   normally. That covers:
-  - agents whose definition's `tools` (an inline list, a `[...]` list or a YAML block list) has no
-    Write, Edit or MultiEdit;
-  - agents whose `disallowedTools` removes all three;
+  - agents whose definition's `tools` (an inline list, a `[...]` list, even over several lines, or a
+    YAML block list) has neither Write nor Edit;
+  - agents whose `disallowedTools` removes both;
   - Explore and Plan.
 
   A definition with `memory` gets Write and Edit back, so it isn't read-only.
-- **Hold budget:** any other subagent is held for at most 12 attempts.
+- **Hold budget:** any other subagent is held for at most 12 attempts while its handoff is
+  missing. A handoff being trimmed is held until the safety limit, like the main session's.
 
 ### Keeping handoffs small
 
@@ -104,6 +138,7 @@ pruned and the slot is written again:
   to move and does it after compaction.
 - **If the limit comes first:** compaction goes ahead with the handoff as it stands and the full
   summary. The returning agent is told the handoff may be half-edited and where the full version is.
+  A long handoff first seen at the limit was never being pruned: it's loaded as it is.
 
 ### Archive
 
@@ -121,8 +156,8 @@ copied, because its git history is the archive.
 - Models with a 200k window aren't held. They compact only about 30k below their limit, which
   leaves no room to wait safely. They compact as usual, without a handoff.
 - Idle compaction and background summary precompute are turned off by the installer, because both
-  would compact behind the hook's back. If they're on anyway, idle compaction is held unless a
-  handoff is ready.
+  would compact behind the hook's back. If idle compaction is on anyway, it's held: a handoff
+  written before the idle stretch is over 10 minutes old by then, so it's asked for again.
 
 The summary can't be switched off without switching off compaction entirely (`DISABLE_COMPACT`).
 Claude Code also keeps a recent stretch of messages word for word, and reloads CLAUDE.md, memory and
@@ -137,16 +172,20 @@ make uninstall   # undoes what install changed
 
 Installing changes `~/.claude/settings.json`, after backing it up next to itself:
 
-- copies the binary to `~/.claude/hooks/auto-handoff` and registers it for ten hook events
+- copies the binary to `~/.claude/hooks/auto-handoff` and registers it for ten hook events. A
+  reinstall swaps in a new file rather than overwriting the old one: macOS can otherwise keep killing
+  a binary that was rewritten while a hook was running it.
 - allows Read/Edit/Write on `~/.local/state/claude-handoffs/**`
 - sets `autoCompactWindow` to 333000 for every model family with a 1M window (Opus, Sonnet and
-  Haiku 5.5, Fable, Mythos, Opus 5)
+  Haiku 5.5, Fable, Mythos, Opus 5, Opus 4.7 and 4.8)
 - sets `idleCompaction` and `precomputeCompactionEnabled` to false
 
 What it changed is recorded in `~/.claude/hooks/auto-handoff.install.json`:
 - **Uninstall** puts back only those values. Anything you've changed since, like a later
   `/autocompact`, stays.
-- **Installing again** (say after a rebuild) keeps those later changes too.
+- **Installing again** (say after a rebuild) keeps those later changes too, and says which values it
+  left alone. A value put back to what it was before the first install, for example by restoring a
+  backup, is managed again.
 - **Your file is edited in place.** A symlinked `settings.json` stays a symlink and keeps its
   permissions.
 - **Unexpected settings are refused.** If `settings.json` isn't valid JSON or has an unexpected
@@ -175,7 +214,7 @@ allow rule.
 - Speed:
   - Each call costs about 0.7ms on top of starting a process.
   - Most calls only touch one file; state is locked and rewritten only while a compaction waits.
-  - Tool output in the hook's input isn't parsed, so a 26MB Edit of a JSON file adds about 20ms.
+  - Tool output in the hook's input isn't parsed, so a 26MB Edit of a JSON file adds about 10ms.
 
 ## Tests
 
@@ -218,5 +257,10 @@ of it undocumented:
 - **Settings the hook can't see:** a project's own `autoCompactWindow`, one passed with
   `--settings`, and windows tuned by the server.
 - **Other projects' PreCompact hooks** run on every held attempt too, so a slow one slows each
-  request while a compaction waits. Their SessionStart(compact) output can also come before the note.
+  request while a compaction waits. Pruning a big handoff can take dozens of requests. Their
+  SessionStart(compact) output can also come before the note.
 - **200k-window models** get no automatic handoff (see "Other cases").
+- **A window above about 440k** (say a later `/autocompact 500k`) puts the compaction point past the
+  450k safety limit, so the hook stops holding for that model. Raise `AUTO_HANDOFF_CEILING` with it.
+- **A compaction Claude Code starts after an API error** (an image or request too large) while a hold
+  is on gets held too, and that one request fails. This hasn't shown up in practice.

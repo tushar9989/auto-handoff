@@ -42,6 +42,7 @@ class InstallTest(unittest.TestCase):
         installed = self.read()
         self.assertEqual(installed["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"], 333000)
         self.assertEqual(installed["modelSettings"]["claude-fable-5-1"]["autoCompactWindow"], 333000)
+        self.assertEqual(installed["modelSettings"]["claude-opus-4-8"]["autoCompactWindow"], 333000)
         self.assertIs(installed["idleCompaction"], False)
         self.assertIs(installed["precomputeCompactionEnabled"], False)
         self.assertEqual(len(installed["hooks"]["SessionEnd"]), 1)
@@ -92,6 +93,40 @@ class InstallTest(unittest.TestCase):
         after = self.read()
         self.assertEqual(after["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"], 500000)
         self.assertIs(after["idleCompaction"], True)
+
+    def test_reinstall_after_restoring_the_backup_manages_again(self):
+        original = {"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 1000000}}, "idleCompaction": True}
+        self.write(original)
+        self.run_install()
+        self.write(original)  # the backup restored by hand
+        out = self.run_install()
+        after = self.read()
+        self.assertEqual(after["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"], 333000)
+        self.assertIs(after["idleCompaction"], False)
+        self.assertNotIn("Left as you set them", out.stdout)
+        self.run_install("--uninstall")
+        self.assertEqual(self.read(), original)
+
+    def test_reinstall_says_what_it_left(self):
+        self.write({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 1000000}}})
+        self.run_install()
+        changed = self.read()
+        changed["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"] = 500000
+        self.write(changed)
+        self.assertIn("Left as you set them since installing: claude-opus-5-5", self.run_install().stdout)
+        changed["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"] = 1000000  # back to the original
+        self.write(changed)
+        self.run_install()
+        self.assertEqual(self.read()["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"], 333000)
+
+    def test_reinstall_swaps_in_a_new_binary_file(self):
+        self.write({"model": "opus"})
+        self.run_install()
+        binary = os.path.join(self.config, "hooks", "auto-handoff")
+        first = os.stat(binary).st_ino
+        self.run_install()
+        self.assertNotEqual(os.stat(binary).st_ino, first)  # never rewritten in place
+        self.assertFalse(os.path.exists(binary + ".new"))
 
     def test_no_settings_file(self):
         self.run_install()
