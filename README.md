@@ -17,8 +17,9 @@ Installing registers the hook in `~/.claude/settings.json` (backed up first) and
 
 Switch it on in any session with `/autocompact 333k`. Compaction then starts about 33k below the
 window, at about 300k tokens; `/autocompact 733k` would start it at about 700k. The setting applies to
-the model you're using, in every session. `/autocompact auto`, or a window above about 890k, switches it
-off again.
+the model you're using, in that session and in sessions started or resumed after it. Sessions already
+open keep the window they started with, so run it in each of them too. `/autocompact auto`, or a window
+above about 890k, switches it off again.
 
 ## How it works
 
