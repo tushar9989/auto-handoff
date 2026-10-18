@@ -26,8 +26,7 @@ clean point. The handoff is then loaded into the fresh context automatically.
 
    Writing the slot is the "ready" signal, so routine edits to a project handoff don't release
    compaction. Once a handoff has been loaded (and archived), its slot is removed, so the next one is a
-   new file: the Write tool won't overwrite a file the agent hasn't read in its current context. A slot written more than 10 minutes before its compaction comes is treated as stale
-   and asked for again.
+   new file: the Write tool won't overwrite a file the agent hasn't read in its current context.
 4. Once the slot is written, the next attempt goes through. The hook asks Claude Code's summarizer
    for a summary under 100 words, since the handoff carries the details. It asks only if the
    conversation being summarized names that slot as the agent's own. Each agent is told its own slot
@@ -51,13 +50,13 @@ Claude Code's compaction hooks don't say which agent is compacting (issue
   Those events are a batch of tool results (PostToolBatch, with the results themselves), a new prompt,
   and a Stop the hook blocks. If the agent's next request reaches its compaction point (less 3k for
   small extras), the hook writes `<session>/crossing/<agent>`.
-- **PreCompact follows within milliseconds**, so the agents that announced in the last 5 seconds are
-  the ones compacting. That's one agent, unless several cross their points at the same moment.
-  Several are all held if any of them is waiting for its handoff, and are all let through otherwise.
+- **PreCompact follows within about 40ms**, so the newest announcement from the last 5 seconds is
+  the compacting agent. Another agent would have to announce inside those 40ms to be taken instead.
 - **If nobody announced**, the main session is the candidate when it's within 50k of its point.
-  Examples are idle compaction and a message no hook saw arrive.
-- An attempt is never blocked when any candidate is past its safety limit or has a small window:
-  blocking either one could make a request fail.
+  Examples are idle compaction and a background agent's report reaching main, which no prompt event
+  announces.
+- An agent past its safety limit, or with a small window, is never blocked: blocking either one could
+  make a request fail.
 
 Agents whose transcript shows they were just compacted have a small size again, so they don't
 announce. If the latest response isn't in the transcript's last 256KB (say, after large tool
@@ -71,7 +70,7 @@ gets wrong means that compaction happens as usual, without a handoff.
 
 Workflow agents' transcripts are found wherever they live.
 
-When several agents cross together, or a guess goes wrong, nothing is lost:
+If the wrong agent is taken, nothing is lost:
 - **The summary stays full.** The summarizer only shortens it when the conversation being compacted
   names that handoff's slot, and no other agent is ever told it.
 - **Every loaded handoff says whose it is** ("the main session", "a subagent (pixel-builder)"), and
@@ -80,8 +79,6 @@ When several agents cross together, or a guess goes wrong, nothing is lost:
   but weren't released, so the agent that really compacted can find its own.
 - **Agents are checked after a release.** An agent released but not compacted (its transcript shows
   no compaction) goes back to waiting, with its handoff still ready.
-- **Missed handoffs are pointed out.** An agent that was compacted while its handoff wasn't loaded is
-  told where its handoff is at its next step that can carry a message.
 
 ### Facts saved at compaction
 
@@ -101,8 +98,8 @@ gets one line saying where the file is, and reads it only if it needs to. A git 
 - **Explore and Plan agents are never held**, since they're told not to change files; they compact
   normally. Every other agent is held whatever its tools: one without Write or Edit can still write
   its handoff with Bash.
-- **Hold budget:** any other subagent is held for at most 12 attempts while its handoff is
-  missing. A handoff being trimmed is held until the safety limit, like the main session's.
+- **Every other subagent is held like the main session**: until its handoff is written (and trimmed),
+  or until the safety limit.
 
 ### Keeping handoffs small
 
@@ -139,8 +136,8 @@ files included. Handoffs being pruned also get a `_before-trim` copy.
 - Models with a 200k window aren't held. They compact only about 30k below their limit, which
   leaves no room to wait safely. They compact as usual, without a handoff.
 - Idle compaction and background summary precompute are turned off by the installer, because both
-  would compact behind the hook's back. If idle compaction is on anyway, it's held: a handoff
-  written before the idle stretch is over 10 minutes old by then, so it's asked for again.
+  would compact behind the hook's back. If idle compaction is on anyway, it's held like any other
+  compaction, and the handoff is asked for at your next prompt.
 
 The summary can't be switched off without switching off compaction entirely (`DISABLE_COMPACT`).
 Claude Code also keeps a recent stretch of messages word for word, and reloads CLAUDE.md, memory and
@@ -234,8 +231,11 @@ of it undocumented:
 
 ## Limits
 
-- **Two agents crossing at once** are handled together: one may wait for the other's handoff, or be
-  let through with it. See "Which agent is compacting" for how that's recovered.
+- **Two agents crossing in the same instant:** if another agent's batch lands in the 40ms between an
+  agent's announcement and its PreCompact, the hold or release goes to the wrong one. See "Which
+  agent is compacting" for how that's recovered.
+- **The cap is asked for once.** A handoff over 9,000 characters holds compaction until it's written
+  again, but whatever is written then goes through, even if it's still over the cap.
 - **Requests no hook announces** fall back to the main session when it's near its compaction point.
   These are a subagent's first request with a large inherited context, and messages that arrive
   without a prompt event. A subagent's compaction there goes through without its handoff. If main is

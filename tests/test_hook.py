@@ -175,19 +175,19 @@ class HookTest(unittest.TestCase):
         self.tool()
         self.assertTrue(self.blocked(self.compact()))
 
-    def test_old_ready_handoff_is_asked_for_again(self):
+    def test_handoff_ready_long_ago_is_released(self):
+        # Written, then the turn ended: the compaction comes at the next request, however much later.
         self.hold()
-        self.write_handoff("main", "Owner: main session - long ago")
+        self.write_handoff("main", "Owner: main session - written, then interrupted")
         with open(os.path.join(self.d, "state.json")) as f:
             st = json.load(f)
-        st["agents"]["main"]["pending"] = time.time() - 1000
+        st["agents"]["main"]["pending"] = time.time() - 7200
         with open(os.path.join(self.d, "state.json"), "w") as f:
             json.dump(st, f)
-        slot = os.path.join(self.d, "main.md")
-        os.utime(slot, (time.time() - 900, time.time() - 900))
+        old = time.time() - 3600
+        os.utime(os.path.join(self.d, "main.md"), (old, old))
         self.tool()
-        self.assertTrue(self.blocked(self.compact()))
-        self.assertIn("compaction is waiting", self.ctx(self.tool()))
+        self.assertTrue(self.shortens_summary(self.compact()))
 
     def test_stop_forces_handoff_once(self):
         self.hold()
@@ -237,11 +237,11 @@ class HookTest(unittest.TestCase):
         self.assertTrue(self.shortens_summary(self.compact("manual")))
         self.assertIn("manual one", self.returned())
 
-    def test_idle_compaction_held_quietly(self):
-        self.tool()
-        self.age("main", 3600)
+    def test_unannounced_compaction_near_the_point_is_held(self):
+        # Say idle compaction, or a background agent's report reaching main: no hook announced it.
+        self.tokens("main", 280_000)
         self.assertTrue(self.blocked(self.compact()))
-        self.assertEqual(self.ctx(self.tool()), "")  # nothing is waiting, so no nudge
+        self.assertIn("compaction is waiting", self.ctx(self.run_hook("UserPromptSubmit", prompt="back")))
 
     def test_nobody_near_the_trigger_is_not_held(self):
         self.tokens("main", 120_000)
@@ -376,49 +376,49 @@ class HookTest(unittest.TestCase):
         self.compact()
         self.assertIn("If that's you, continue from it; if it isn't, ignore it", self.returned())
 
-    def test_crossing_together_releases_both_and_recovers(self):
-        # main and a subagent both announce, both with their handoffs ready: both are released, and the
-        # one that didn't compact goes back to waiting.
-        self.tokens("main", 310_000)
-        self.tokens("sub", 300_000)
-        self.run_hook("SubagentStart", "sub", agent_type="builder")
-        self.hold("sub")
-        self.write_handoff("sub", "Owner: subagent - SUB TASK")
-        self.hold()
-        self.write_handoff("main", "Owner: main session - MAIN TASK")
-        self.tool()
-        self.tool("sub")
+    def test_wrong_pick_is_recovered(self):
+        # A and B both wait with their handoffs ready. B's batch lands in the moment between A's
+        # announcement and A's PreCompact, so B is released, but A is the one compacted.
+        self.tokens("main", 50_000)
+        for agent in ("A", "B"):
+            self.tokens(agent, 300_000)
+            self.run_hook("SubagentStart", agent, agent_type="builder")
+            self.hold(agent)
+            self.write_handoff(agent, "Owner: subagent - TASK %s" % agent)
+        self.tool("A")
+        time.sleep(0.01)
+        self.tool("B")
         out = self.compact()
-        # Each summarizer only shortens the summary if its conversation names its own slot.
-        self.assertIn("If this conversation names " + os.path.join(self.d, "sub.md"), out["text"])
-        self.assertIn("If this conversation names " + os.path.join(self.d, "main.md"), out["text"])
-        injected = self.returned("main")
-        self.assertIn("YOUR handoff", injected)
-        self.assertIn("MAIN TASK", injected)
-        self.assertIn("SUB TASK", injected)
-        self.tool()
-        self.assertNotIn("pending", self.agents()["main"])
-        self.tool("sub")  # the subagent wasn't compacted, so it waits again with its handoff
-        self.assertIn("pending", self.agents()["sub"])
-        self.assertNotIn("released", self.agents()["sub"])
-        self.tool("sub")
+        self.assertIn(os.path.join(self.d, "B.md"), out["text"])  # B released: the summary instruction names B's slot
+        back = self.returned("A")
+        self.assertIn("TASK B", back)  # labelled as B's
+        self.assertIn("ready but weren't loaded", back)
+        self.assertIn(os.path.join(self.d, "A.md"), back)  # A finds its own
+        self.tool("A")
+        self.assertNotIn("pending", self.agents()["A"])
+        self.assertTrue(os.path.exists(os.path.join(self.d, "A.md")))  # kept: it wasn't loaded
+        self.tool("B")
+        self.assertIn("pending", self.agents()["B"])  # not compacted: waiting again
+        self.assertNotIn("released", self.agents()["B"])
+        self.tool("B")
         self.assertTrue(self.shortens_summary(self.compact()))
-        self.assertIn("SUB TASK", self.returned("sub"))
-        self.assertEqual(len([f for f in self.archived() if f.endswith("_sub.md")]), 1)  # archived once
-        self.assertEqual(len([f for f in self.archived() if f.endswith("_main.md")]), 1)
+        self.assertIn("TASK B", self.returned("B"))
+        self.assertEqual(len([f for f in self.archived() if f.endswith("_A.md")]), 1)  # archived once
+        self.assertEqual(len([f for f in self.archived() if f.endswith("_B.md")]), 1)
 
     def explore(self, agent, tokens):
         self.tokens(agent, tokens)
         self.run_hook("SubagentStart", agent, agent_type="Explore")
 
-    def test_crossing_together_holds_for_the_one_that_owes(self):
+    def test_newest_announcement_is_the_one_compacting(self):
         self.tokens("main", 301_000)
-        self.explore("exp", 300_000)
+        self.tokens("A", 300_000)
         self.tool()
-        self.tool("exp")  # the read-only agent acts last, but main crosses its compaction point too
+        time.sleep(0.01)
+        self.tool("A")
         self.assertTrue(self.blocked(self.compact()))
-        self.assertIn("pending", self.agents()["main"])
-        self.assertNotIn("exp", self.agents())
+        self.assertIn("pending", self.agents()["A"])
+        self.assertNotIn("main", self.agents())  # main announced too, but A's request came last
 
     def test_agent_below_its_point_is_not_a_candidate(self):
         self.tokens("main", 275_000)  # near its 300k point, but its next request doesn't cross it
@@ -433,25 +433,6 @@ class HookTest(unittest.TestCase):
         self.explore("exp", 280_000)
         self.tool("exp")
         self.assertFalse(self.blocked(self.compact()))
-
-    def test_crossing_together_waits_for_both_handoffs(self):
-        self.tokens("main", 50_000)
-        self.tokens("A", 305_000)
-        self.tokens("B", 302_000)
-        self.hold("A")
-        self.write_handoff("A", "Owner: subagent A")
-        self.tool("B")
-        self.tool("A")
-        self.assertTrue(self.blocked(self.compact()))  # B crosses too and owes its handoff
-        self.assertIn("pending", self.agents()["B"])
-        self.assertNotIn("released", self.agents()["A"])
-        self.write_handoff("B", "Owner: subagent B")
-        self.tool("B")
-        self.tool("A")
-        out = self.compact()
-        self.assertTrue(self.shortens_summary(out))
-        self.assertIn(os.path.join(self.d, "A.md"), out["text"])
-        self.assertIn(os.path.join(self.d, "B.md"), out["text"])
 
     def test_released_agent_is_let_through_again(self):
         self.tokens("main", 50_000)
@@ -478,19 +459,22 @@ class HookTest(unittest.TestCase):
         self.assertTrue(self.blocked(self.compact()))
         self.assertIn("pending", self.agents()["main"])
 
-    def test_agent_at_its_limit_always_goes_through(self):
-        self.tokens("main", 460_000)
-        self.tokens("A", 300_000)
+    def test_agent_at_its_limit_goes_through(self):
+        self.tokens("main", 300_000)
+        self.tokens("A", 460_000)
         self.tool()
+        time.sleep(0.01)
         self.tool("A")
         self.assertFalse(self.blocked(self.compact()))
 
-    def test_missed_handoff_waits_for_an_event_that_can_reply(self):
+    def test_unloaded_handoff_is_listed_after_compaction(self):
         self.hold()
         self.write_handoff("main", "Owner: main session - MINE")
-        self.returned("main")  # compacted, but its handoff wasn't released
-        self.assertIn("read " + os.path.join(self.d, "main.md"), self.ctx(self.tool()))
-        self.assertEqual(self.ctx(self.tool()), "")  # said once
+        back = self.returned("main")  # compacted, but its handoff wasn't released
+        self.assertIn("ready but weren't loaded", back)
+        self.assertIn(os.path.join(self.d, "main.md"), back)
+        self.tool()
+        self.assertNotIn("pending", self.agents()["main"])
         self.assertEqual(len(self.archived()), 1)
 
     def test_usage_is_found_past_large_images(self):
@@ -579,24 +563,22 @@ class HookTest(unittest.TestCase):
         self.assertNotIn("just compacted", self.returned())
         self.assertEqual(self.ctx(self.tool("exp")), "")
 
-    def test_custom_agent_is_held_whatever_its_tools(self):
-        # A reviewer without Write or Edit still writes files with Bash, so it can write a handoff.
-        os.makedirs(os.path.join(self.config, "agents"))
-        with open(os.path.join(self.config, "agents", "art-reviewer.md"), "w") as f:
-            f.write("---\nname: art-reviewer\ntools: Read, Grep, Glob, Bash, SendMessage\n---\nReview art.\n")
+    def test_custom_agent_is_held(self):
+        # Only Explore and Plan are left alone: an agent without Write or Edit can still write with Bash.
         self.tokens("main", 50_000)
         self.tokens("rev", 300_000)
         self.assertIn("rev.md", self.ctx(self.run_hook("SubagentStart", "rev", agent_type="art-reviewer")))
         self.hold("rev")
 
-    def test_subagent_hold_budget(self):
+    def test_subagent_is_held_until_its_safety_limit_like_main(self):
         self.tokens("main", 50_000)
         self.tokens("agentA", 300_000)
-        for _ in range(12):
+        for _ in range(20):
             self.hold("agentA")
+        self.tokens("agentA", 455_000)
         self.tool("agentA")
         self.assertFalse(self.blocked(self.compact()))
-        self.assertIn("before a handoff was written", self.returned())
+        self.assertIn("before a handoff was written", self.returned("agentA"))
 
     # ---- trimming
 
@@ -699,14 +681,6 @@ class HookTest(unittest.TestCase):
         self.tokens("main", 300_000)
         self.hold()
         self.assertIn("This session's handoff file is " + handoff, self.ctx(self.tool()))
-
-    def test_committed_handoff_is_archived_too(self):
-        self.project_handoff("# Game handoff\nin git", git=True)
-        self.hold()
-        self.write_handoff("main", os.path.join(self.tmp.name, "game", "docs", "HANDOFF.md"))
-        self.tool()
-        self.assertTrue(self.shortens_summary(self.compact()))
-        self.assertEqual(len(self.archived()), 1)
 
     def test_long_project_handoff_is_copied_then_trimmed_in_place(self):
         handoff = self.project_handoff("# Game handoff\n" + "y" * 20_000)

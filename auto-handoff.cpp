@@ -3,22 +3,22 @@
 //
 // Every hook event runs this one binary (see README.md for the flow). Per-session state lives in
 // ~/.local/state/claude-handoffs/<session_id>/: a <agent>.md slot per agent ("main", or a subagent's
-// agent_id), state.json, events/<agent> (its mtime is that agent's last activity), types/<agent>
-// ("<agent_type>\t<rw|ro>\t<window>"), paths/<agent> (where that subagent's transcript is) and mode
-// (the main session's permission mode).
+// agent_id), state.json, crossing/<agent> (that agent's next request reaches its compaction point),
+// types/<agent> (its agent_type), paths/<agent> (where that subagent's transcript is) and mode (the
+// main session's permission mode).
 //
 // Writing the slot is the signal that the handoff is ready. The slot holds the handoff itself, or the
 // path of a handoff file the session already keeps (say a HANDOFF.md in the project), which stays
-// where it is. Loaded handoffs, and project handoffs about to be trimmed, are copied to
-// archive/<project folder>/, never pruned, unless git has them committed unchanged.
+// where it is. Loaded handoffs, and handoffs about to be trimmed, are copied to archive/<project
+// folder>/ and never pruned.
 //
-// Claude Code's compaction hooks don't say which agent is compacting. PreCompact fires right after
-// the compacting agent's own tool call, so the hook takes the agent active a moment ago whose context
-// is near its compaction point, else the largest context near its point; when none is, it doesn't
-// hold. After compaction each agent picks its own handoff from labelled candidates, because passing
-// identity from hook to hook races when agents compact in parallel.
+// Claude Code's compaction hooks don't say which agent is compacting. So before each request an agent
+// makes, the hook works out whether it reaches the agent's compaction point, the way Claude Code
+// does, and if so the agent announces itself in crossing/<agent>. PreCompact follows within
+// milliseconds and takes the newest announcement. After compaction each agent picks its own handoff
+// from labelled candidates, because SessionStart(compact) doesn't say whose context it is either.
 //
-// Hooks run on every tool call, so this is a dependency-free native binary that skips the parts of
+// Hooks run before every request, so this is a dependency-free native binary that skips the parts of
 // its input it doesn't need.
 
 #include <dirent.h>
@@ -58,14 +58,10 @@ const double kAnnounceSeconds = 5;         // PreCompact follows the compacting 
 const double kBytesPerToken = 3;           // Claude Code's size estimate for the 1M-window models (older: 4)
 const double kMediaTokens = 2000;          // and for each image or document
 const double kMinRoom = 40000;             // hold only where the safety limit is this far above the trigger
-const double kTightSlack = 20000;          // a small-window agent this close to its trigger is never blocked
-const int kSubagentMaxHolds = 12;          // a subagent held this often compacts without a handoff
-const double kReadySeconds = 600;          // a handoff this much older than its compaction is stale
 const size_t kInjectCap = 9500;            // Claude Code moves hook context over 10,000 chars to a file
 const long kHandoffCap = 9000;             // a longer handoff holds compaction until it's trimmed
 const long kReadCap = 1 << 20;             // handoff files are read and archived up to this size
 const int kNudgeEvery = 5;                 // tool calls between reminders while a compaction waits
-const double kIdleSeconds = 20 * 60;       // a compaction this long after the last activity is idle compaction
 const double kKeepDays = 14;
 const long kTranscriptNear = 256 << 10;    // bytes of transcript searched first for the latest usage
 const long kTranscriptTail = 4 << 20;      // searched next
@@ -91,9 +87,11 @@ const char* kNudge =
     "loaded into your fresh context so you can carry on.\n\n"
     "Write it for a reader who has only the handoff, keeping any structure the file already has. Unless it "
     "has its own heading, start with \"Owner: \" and your task in a few words (\"main session\" first if you "
-    "are the main conversation). Cover: the goal and what the user asked for; what's in progress and not "
-    "started; the next steps in order; key files and what each holds; decisions that still constrain the "
-    "work, and why; open questions for the user.\n\n"
+    "are the main conversation). Easy to lose across a compaction, so include them where they apply: the "
+    "rulings you were given, word for word; anything still running in the background and how to check on "
+    "it; whether \"done\" or \"passing\" was actually checked; the exact state of anything left unfinished "
+    "and how to resume or undo it; for an investigation, the current hypotheses and the evidence for "
+    "each.\n\n"
     "Housekeeping, so the handoff stays small however long the session runs:\n"
     "- Rewrite it rather than append to it. An earlier handoff in your context is material to prune, not a "
     "base to add to.\n"
@@ -168,11 +166,6 @@ const char* kTrimDone =
 const char* kTrimReminder =
     "[auto-handoff] Reminder: compaction is waiting for your handoff ({file}, {chars} characters) to be "
     "pruned under 9,000 characters. When it's done, write {what} to {path} again.";
-
-// Settled without its handoff loaded: the release went to another agent, or nothing was released.
-const char* kMissed =
-    "[auto-handoff] Your context was compacted a moment ago, and the handoff you wrote for it may not have "
-    "been loaded. If it isn't in your context already, read {file} before going on.";
 
 // PreCompact's plain stdout is appended to the summary prompt (undocumented; read from 2.1.302's code
 // and verified live). With a handoff about to be loaded, the full summary is redundant: keep it short.
@@ -613,12 +606,6 @@ void write_atomic(const std::string& p, const std::string& data) {
   rename(tmp.c_str(), p.c_str());
 }
 
-void touch(const std::string& p) {
-  int fd = open(p.c_str(), O_WRONLY | O_CREAT | O_NONBLOCK, 0600);
-  if (fd >= 0) close(fd);
-  utimes(p.c_str(), nullptr);
-}
-
 std::vector<std::string> list_dir(const std::string& p) {
   std::vector<std::string> names;
   if (DIR* dir = opendir(p.c_str())) {
@@ -871,25 +858,6 @@ std::string archive(const std::string& d, const std::string& agent, const std::s
 
 // ---- Agents.
 
-void note_event(const std::string& d, const std::string& agent) {
-  std::string dir = d + "/events";
-  if (mtime(dir) < 0) mkdirs(dir);
-  touch(dir + "/" + agent);
-}
-
-struct Event {
-  std::string agent;
-  double t;
-};
-
-// Agents by latest activity, newest first.
-std::vector<Event> events(const std::string& d) {
-  std::vector<Event> evs;
-  for (const auto& name : list_dir(d + "/events")) evs.push_back({name, mtime(d + "/events/" + name)});
-  std::sort(evs.begin(), evs.end(), [](const Event& a, const Event& b) { return a.t > b.t; });
-  return evs;
-}
-
 // A subagent's type, as on_subagent_start recorded it in types/<agent>, and whether it can be asked for
 // a handoff.
 struct AgentInfo {
@@ -1083,23 +1051,23 @@ void announce(const std::string& d, const std::string& transcript, const std::st
   }
 }
 
-// Who is compacting: the agents that announced a moment ago that their next request crosses their
-// compaction point. That's one, unless several cross at once. With none (a request no hook saw coming,
-// such as idle compaction), the main session, if it's near its compaction point.
-std::vector<Candidate> compacting(const std::string& d, const std::string& transcript, double t) {
-  std::vector<Candidate> found;
+// Who is compacting: the agent whose announcement is newest, if it's from a moment ago. PreCompact
+// follows its own agent's announcement by about 40ms, so another agent's would have to land in between.
+// With none (a request no hook saw coming, such as a background agent's report reaching main), the main
+// session, if it's near its compaction point.
+bool compacting(const std::string& d, const std::string& transcript, double t, Candidate& out) {
+  std::string newest, est;
+  double newest_t = t - kAnnounceSeconds;
   for (const auto& agent : list_dir(d + "/crossing")) {
-    std::string p = d + "/crossing/" + agent, est;
-    if (t - mtime(p) > kAnnounceSeconds || !read_file(p, est)) continue;
-    Candidate c = candidate(d, transcript, agent, atof(est.c_str()));
-    if (c.u.tokens > 0) found.push_back(c);
+    double m = mtime(d + "/crossing/" + agent);
+    if (m >= newest_t) newest = agent, newest_t = m;
   }
-  if (found.empty()) {
-    Candidate c = candidate(d, transcript, "main", 0);
-    double near = c.tight ? kTightSlack : kTriggerSlack;  // a small window is only near when really close
-    if (c.u.tokens > 0 && c.u.tokens >= c.trigger - near) found.push_back(c);
+  if (!newest.empty() && read_file(d + "/crossing/" + newest, est)) {
+    out = candidate(d, transcript, newest, atof(est.c_str()));
+    if (out.u.tokens > 0) return true;
   }
-  return found;
+  out = candidate(d, transcript, "main", 0);
+  return out.u.tokens > 0 && out.u.tokens >= out.trigger - kTriggerSlack;
 }
 
 // ---- Messages.
@@ -1359,7 +1327,7 @@ void on_subagent_start(const Json& in, const std::string& d, const std::string& 
 
 void on_subagent_stop(const Json& in, const std::string& d, const std::string& agent) {
   if (in.str("agent_type").empty()) return;
-  for (const char* sub : {"/events/", "/types/", "/paths/", "/crossing/"}) unlink((d + sub + agent).c_str());
+  for (const char* sub : {"/types/", "/paths/", "/crossing/"}) unlink((d + sub + agent).c_str());
   if (!load_state(d).get("agents")->has(agent)) return;
   Lock lock(d);
   Json st = load_state(d);
@@ -1381,44 +1349,36 @@ bool planning(const std::string& d) {
 }
 
 // After its compaction, or once its transcript shows it was compacted some other way, an agent is no
-// longer waiting. Returns true when it settled; `missed` is then the handoff it had ready but didn't
-// get back, if any.
-bool settle_if_compacted(const std::string& d, const Json& in, const std::string& agent, Json& st, Json& a,
-                         std::string& missed) {
+// longer waiting.
+void settle_if_compacted(const std::string& d, const Json& in, const std::string& agent, Json& st, Json& a) {
   std::string transcript = transcript_of(d, in.str("transcript_path"), agent);
   if (a.has("released")) {  // its first activity since: was it the one compacted?
     if (transcript.empty() || mtime(transcript) < 0 || compacted_since(transcript, a.num("released"))) {
       // Loaded and archived: remove the slot, so the next handoff is a new file. The Write tool won't
       // overwrite a file the agent hasn't read in this context.
       if (a.str("why") == "handoff") unlink(slot_path(d, agent).c_str());
-      settle(a);
-      return true;
+      return settle(a);
     }
     log(d, agent + " was released but not compacted (another agent was); waiting again");
     for (const char* key : {"released", "why", "unfinished"}) a.erase(key);
-    return false;
+    return;
   }
   if (!a.has("pending") || st.num("last_compact") < a.num("pending") || a.num("checked") >= st.num("last_compact"))
-    return false;
+    return;
   set(a, "checked", st.num("last_compact"));
-  if (!compacted_since(transcript, a.num("pending"))) return false;
+  if (!compacted_since(transcript, a.num("pending"))) return;
+  // A ready handoff it had was listed in its fresh context ("ready but weren't loaded"): keep a copy.
   log(d, agent + " was compacted without its handoff being released; no longer waiting");
-  if (slot_ready(d, agent, a.num("pending"))) {
-    missed = handoff_file(d, agent);
-    archive_once(d, agent, a, session_cwd(d, in));
-  }
+  if (slot_ready(d, agent, a.num("pending"))) archive_once(d, agent, a, session_cwd(d, in));
   settle(a);
-  if (!missed.empty()) a.at("missed") = Json::string(missed);  // said at its next event that can reply
-  return true;
 }
 
-// Whether an agent has anything going on: waiting, just released, or owed a message.
-bool busy(const Json* a) { return a && (a->has("pending") || a->has("released") || a->has("missed")); }
+// Whether an agent has anything going on: waiting, or just released.
+bool busy(const Json* a) { return a && (a->has("pending") || a->has("released")); }
 
 // A batch of tool results or a new prompt, just before the agent's next request: announce it if it
 // crosses the compaction point, and remind an agent that is holding up its own compaction.
 void on_activity(const Json& in, const std::string& d, const std::string& agent, const std::string& ev) {
-  note_event(d, agent);
   if (agent == "main") note_mode(d, in.str("permission_mode"));
   announce(d, in.str("transcript_path"), agent, in.num("added"));
   {
@@ -1431,14 +1391,7 @@ void on_activity(const Json& in, const std::string& d, const std::string& agent,
     Json st = load_state(d);
     Json* cur = st.get("agents")->get(agent);
     if (!cur) return;
-    std::string missed;
-    settle_if_compacted(d, in, agent, st, *cur, missed);
-    if (cur->has("missed")) {
-      std::string file = cur->str("missed");
-      cur->erase("missed");
-      save_state(d, st);
-      return context(ev, replace_all(kMissed, "{file}", file));
-    }
+    settle_if_compacted(d, in, agent, st, *cur);
     if (!cur->has("pending") || cur->has("released") || in.str("permission_mode") == "plan")
       return save_state(d, st);
     int n = int(cur->num("nudges")) + 1;
@@ -1475,7 +1428,6 @@ void on_activity(const Json& in, const std::string& d, const std::string& agent,
 
 // The end of a turn is a clean point: if compaction is waiting, write (or trim) the handoff now.
 void on_stop(const Json& in, const std::string& d, const std::string& agent) {
-  note_event(d, agent);
   if (agent == "main") note_mode(d, in.str("permission_mode"));
   {
     Json st = load_state(d);
@@ -1487,21 +1439,16 @@ void on_stop(const Json& in, const std::string& d, const std::string& agent) {
     block(text);
   };
   Json a;
-  std::string missed;
-  bool quiet = in.truthy("stop_hook_active") || in.str("permission_mode") == "plan";
   {
     Lock lock(d);
     Json st = load_state(d);
     Json* cur = st.get("agents")->get(agent);
     if (!cur) return;
-    settle_if_compacted(d, in, agent, st, *cur, missed);
-    missed = quiet ? "" : cur->str("missed");
-    if (!missed.empty()) cur->erase("missed");
+    settle_if_compacted(d, in, agent, st, *cur);
     a = *cur;
     save_state(d, st);
   }
-  if (!missed.empty()) return go_on(replace_all(kMissed, "{file}", missed));
-  if (quiet) return;
+  if (in.truthy("stop_hook_active") || in.str("permission_mode") == "plan") return;
   if (!a.has("pending") || a.has("released")) return;
   if (slot_ready(d, agent, a.num("pending"))) {
     if (!needs_trim(d, agent, a)) return;
@@ -1517,13 +1464,8 @@ void on_stop(const Json& in, const std::string& d, const std::string& agent) {
         "\n\nThe end of this turn is a clean point, so write the handoff now, then finish your reply.");
 }
 
-// A ready handoff written long before this compaction: asked for again.
-bool stale(const std::string& d, const std::string& agent, const Json& a, double t) {
-  return !a.has("trim") && t - mtime(slot_path(d, agent)) > kReadySeconds;
-}
-
-bool ready(const std::string& d, const std::string& agent, const Json& a, double t) {
-  return a.has("pending") && slot_ready(d, agent, a.num("pending")) && !stale(d, agent, a, t);
+bool ready(const std::string& d, const std::string& agent, const Json& a) {
+  return a.has("pending") && slot_ready(d, agent, a.num("pending"));
 }
 
 // Over the cap and not yet asked to trim, or asked and the slot not written again since.
@@ -1531,25 +1473,21 @@ bool trimming(const std::string& d, const std::string& agent, const Json& a) {
   return a.has("trim") ? needs_trim(d, agent, a) : file_size(handoff_file(d, agent)) > kHandoffCap;
 }
 
-// Whether this agent's compaction waits for its handoff. Changes nothing: hold() and let_through() do.
-bool wants_hold(const std::string& d, const Json& st, const Candidate& c, double t) {
+// Whether this agent's compaction waits for its handoff: until it's written (and trimmed), or the
+// safety limit. Changes nothing: hold() and let_through() do.
+bool wants_hold(const std::string& d, const Json& st, const Candidate& c) {
   static const Json none = Json::object();
   const Json* found = st.get("agents")->get(c.agent);
   const Json& a = found ? *found : none;
   if (a.has("released") || c.at_limit) return false;  // released: another attempt for the same compaction
   if (c.info.readonly || c.tight || (c.agent == "main" && planning(d))) return false;
-  if (ready(d, c.agent, a, t)) return trimming(d, c.agent, a);
-  return c.agent == "main" || a.num("holds") < kSubagentMaxHolds;
+  return !ready(d, c.agent, a) || trimming(d, c.agent, a);
 }
 
-void hold(const std::string& d, Json& st, const Candidate& c, double t, bool idle, const std::string& cwd) {
+void hold(const std::string& d, Json& st, const Candidate& c, double t, const std::string& cwd) {
   const std::string& who = c.agent;
   Json& a = st.get("agents")->at(who);
-  if (a.has("pending") && slot_ready(d, who, a.num("pending")) && stale(d, who, a, t)) {
-    log(d, who + "'s handoff is too old for this compaction; asking again");
-    set(a, "pending", t);
-    set(a, "nudges", 0);
-  } else if (ready(d, who, a, t)) {  // being trimmed
+  if (ready(d, who, a)) {  // being trimmed
     if (!a.has("trim")) {  // keep the long version before it's pruned
       set(a, "trim", t);
       set(a, "limit", c.limit);
@@ -1558,27 +1496,25 @@ void hold(const std::string& d, Json& st, const Candidate& c, double t, bool idl
     return log(d, "compaction of " + who + " held: handoff is " + std::to_string(file_size(handoff_file(d, who))) +
                       " characters");
   }
-  set(a, "holds", a.num("holds") + 1);
-  if (!idle && !a.has("pending")) {
+  if (!a.has("pending")) {
     set(a, "pending", t);
     set(a, "tokens", c.u.tokens);
     set(a, "limit", c.limit);
     set(a, "nudges", 0);
   }
-  log(d, "compaction of " + who + " held (" + std::to_string(long(c.u.tokens)) + " tokens" + (idle ? ", idle" : "") + ")");
+  log(d, "compaction of " + who + " held (" + std::to_string(long(c.u.tokens)) + " tokens)");
 }
 
 // Lets an agent's compaction through, with its handoff if it has one. Returns the summary instructions
 // for it, if any.
-std::string let_through(const std::string& d, Json& st, const Candidate& c, double t, bool no_block,
-                        const std::string& cwd) {
+std::string let_through(const std::string& d, Json& st, const Candidate& c, double t, const std::string& cwd) {
   const std::string& who = c.agent;
   Json& a = st.get("agents")->at(who);
   if (a.has("released")) {  // another attempt for the same compaction
     log(d, "compaction of " + who + " allowed again: " + a.str("why"));
     return a.str("why") == "handoff" && !a.has("unfinished") ? summary_instructions(d, who) : "";
   }
-  if (ready(d, who, a, t)) {
+  if (ready(d, who, a)) {
     bool unfinished = trimming(d, who, a) && a.has("trim");  // over the cap but never asked to trim: complete, just long
     release(d, who, a, "handoff", cwd);
     if (unfinished) set(a, "unfinished", t);
@@ -1595,11 +1531,9 @@ std::string let_through(const std::string& d, Json& st, const Candidate& c, doub
     log(d, "compaction of " + who + " allowed: " + skip);
     return "";
   }
-  release(d, who, a, "limit", cwd);
-  log(d, "compaction of " + who + " allowed: " +
-             (c.at_limit  ? "safety limit (" + std::to_string(long(c.u.tokens)) + " >= " + std::to_string(long(c.limit)) + " tokens)"
-              : no_block  ? "another agent compacting with it can't wait"
-                          : "hold budget used up"));
+  release(d, who, a, "limit", cwd);  // past the safety limit without a handoff
+  log(d, "compaction of " + who + " allowed: safety limit (" + std::to_string(long(c.u.tokens)) + " >= " +
+             std::to_string(long(c.limit)) + " tokens)");
   return "";
 }
 
@@ -1617,33 +1551,18 @@ void on_pre_compact(const Json& in, const std::string& d) {
     return save_state(d, st);
   }
 
-  std::vector<Event> evs = events(d);
-  bool idle = evs.empty() || t - evs[0].t > kIdleSeconds;
-  std::vector<Candidate> found = compacting(d, in.str("transcript_path"), t);
-  if (found.empty()) return log(d, "compaction allowed: no agent is at its compaction point");
-  // Blocking a request past the safety limit could make it fail, and a small window has no room to wait.
-  bool no_block = false;
-  for (const auto& c : found) no_block = no_block || c.at_limit || c.tight;
-
+  Candidate c;
+  if (!compacting(d, in.str("transcript_path"), t, c))
+    return log(d, "compaction allowed: no agent is at its compaction point");
   Lock lock(d);
   Json st = load_state(d);
   std::string cwd = st.str("cwd").empty() ? in.str("cwd") : st.str("cwd");
-  // Several agents only when they cross at the same moment: held if any of them is, else all let through.
-  bool held = false;
-  for (const auto& c : found)
-    if (!no_block && wants_hold(d, st, c, t)) {
-      hold(d, st, c, t, idle, cwd);
-      held = true;
-    }
-  if (held) {
+  if (wants_hold(d, st, c)) {
+    hold(d, st, c, t, cwd);
     save_state(d, st);
     return block("auto-handoff: waiting for a handoff before compacting");
   }
-  std::string out;
-  for (const auto& c : found) {
-    std::string text = let_through(d, st, c, t, no_block, cwd);
-    if (!text.empty()) out += (out.empty() ? "" : "\n\n") + text;
-  }
+  std::string out = let_through(d, st, c, t, cwd);
   save_state(d, st);
   if (!out.empty()) emit(out);
 }
@@ -1695,7 +1614,7 @@ int main() {
   // Only these fields are used; the rest (tool input and output can be megabytes) is skipped unparsed.
   Json in;
   if (!Parser(text).parse_top(in, {"hook_event_name", "session_id", "agent_id", "agent_type", "source", "trigger",
-                                   "transcript_path", "cwd", "stop_hook_active", "reason", "permission_mode"}))
+                                   "transcript_path", "cwd", "stop_hook_active", "permission_mode"}))
     return 0;
   // What the next request adds: the batch's tool results, or the prompt.
   std::string ev = in.str("hook_event_name");
