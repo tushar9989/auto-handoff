@@ -276,3 +276,7 @@ of it undocumented:
 - **200k-window models** get no automatic handoff (see "Other cases").
 - **A compaction Claude Code starts after an API error** (an image or request too large) while a hold
   is on gets held too, and that one request fails. This hasn't shown up in practice.
+
+## License
+
+Public domain, under the [Unlicense](LICENSE).
