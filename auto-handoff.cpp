@@ -62,7 +62,7 @@ extern char** environ;
 namespace {
 
 const double kHoldRoom = 150000;           // hold at most this far past the compaction point (450k at 300k)
-const double kDefaultWindow = 200000;      // unknown model: assume a small window so the limit errs early
+const double kDefaultWindow = 200000;      // unknown model: assume a small window, which leaves the hook off
 const double kWindowShare = 0.9;           // never hold past this share of the model's real window
 const double kTriggerGap = 33000;          // auto-compact fires about this far below its window
 const double kTriggerSlack = 50000;        // with no agent announced, main is held only this close to its trigger
@@ -1034,11 +1034,12 @@ double limit_for(double native, double configured) {
   return std::min(trigger_for(native, configured) + kHoldRoom, kWindowShare * native);
 }
 
-// Whether the hook is on: the compaction point leaves room to wait below the safety limit. That takes
-// a window set with /autocompact (up to about 890k on a 1M model). The model's own window ("auto", or
-// nothing set) puts the point past the limit, and so does a 200k model's: off.
+// Whether the hook is on: a 1M model whose compaction point leaves room to wait below the safety limit.
+// That takes a window set with /autocompact, up to about 890k. The model's own window ("auto", or nothing
+// set) puts the point past the limit: off. A 200k model is off whatever its window: Claude Code refuses
+// its requests from 177k, too close to wait safely.
 bool on_for(double native, double configured) {
-  return limit_for(native, configured) - trigger_for(native, configured) >= kMinRoom;
+  return native >= 1e6 && limit_for(native, configured) - trigger_for(native, configured) >= kMinRoom;
 }
 
 double trigger_point(const std::string& model) { return trigger_for(window(model), configured_window(model)); }
@@ -1398,8 +1399,8 @@ bool planning(const std::string& d, const std::string& agent) {
 }
 
 // After its compaction, or once its transcript shows it was compacted some other way, an agent is no
-// longer waiting. Nor is one whose context shrank well below its compaction point without one (say a
-// rewind): `u` is its latest size.
+// longer waiting. Nor is one the hook is now off for (its window was changed), or one whose context
+// shrank well below its compaction point without one (say a rewind): `u` is its latest size.
 void settle_if_compacted(const std::string& d, const Json& in, const std::string& agent, Json& st, Json& a,
                          const Usage& u) {
   std::string transcript = transcript_of(d, in.str("transcript_path"), agent);
@@ -1423,6 +1424,10 @@ void settle_if_compacted(const std::string& d, const Json& in, const std::string
       if (slot_ready(d, agent, a.num("pending"))) archive_once(d, agent, a, session_cwd(d, in));
       return settle(a);
     }
+  }
+  if (!u.model.empty() && !holds(u.model)) {
+    log(d, agent + " is no longer held: the hook is off for " + u.model + " now");
+    return settle(a);
   }
   if (u.tokens >= 0 && u.tokens < trigger_point(u.model) - kTriggerSlack) {
     log(d, agent + "'s context shrank to " + std::to_string(long(u.tokens)) + " tokens without a compaction; no longer waiting");

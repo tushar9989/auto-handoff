@@ -192,6 +192,21 @@ class HookTest(unittest.TestCase):
         self.tokens("main", 300_000)
         self.hold()
 
+    def test_switching_off_while_held_lets_the_agent_go(self):
+        # /autocompact auto, or a window past about 890k: the hook is off, so main stops waiting at once,
+        # even when still close to the new compaction point.
+        for window in ("auto", 900000):
+            self.tearDown()
+            self.setUp()
+            self.settings({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 893000}}})
+            self.tokens("main", 875_000)
+            self.hold()
+            self.settings({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": window}}})
+            self.tokens("main", 876_000)
+            self.assertEqual(self.ctx(self.tool()), "")
+            self.assertIsNone(self.run_hook("Stop", stop_hook_active=False))
+            self.assertEqual(list(self.agents()["main"]), ["compacted"])
+
     def test_handoff_written_before_waiting_is_stale(self):
         self.write_handoff("main", "Owner: main session - old")
         self.hold()
@@ -265,7 +280,7 @@ class HookTest(unittest.TestCase):
     def test_unknown_model_uses_small_window(self):
         self.tokens("main", 185_000, model="some-new-model")
         self.tool()
-        self.assertFalse(self.blocked(self.compact()))  # 90% of an assumed 200k window
+        self.assertFalse(self.blocked(self.compact()))  # assumed to have a 200k window: off
 
     def test_fable_has_a_million_window(self):
         self.tokens("main", 300_000, model="claude-fable-5-1")
@@ -605,11 +620,18 @@ class HookTest(unittest.TestCase):
     # ---- compaction points
 
     def test_small_window_model_is_not_held(self):
-        # A 200k model compacts about 30k below its limit: no room to hold for a handoff safely.
-        self.tokens("main", 170_000, model="claude-haiku-4-5")
-        self.tool()
-        self.assertFalse(self.blocked(self.compact()))
-        self.assertNotIn("just compacted", self.returned())
+        # Claude Code refuses a 200k model's requests from 177k: no room to hold for a handoff safely,
+        # even with a smaller window set for it.
+        for settings in ({"autoCompactWindow": 333000},
+                         {"modelSettings": {"claude-haiku-4-5": {"autoCompactWindow": 150000}}}):
+            self.tearDown()
+            self.setUp()
+            self.settings(settings)
+            self.tokens("main", 170_000, model="claude-haiku-4-5")
+            self.assertEqual(self.ctx(self.run_hook("SessionStart", source="startup")), "")
+            self.tool()
+            self.assertFalse(self.blocked(self.compact()))
+            self.assertNotIn("just compacted", self.returned())
 
     def test_window_settings(self):
         def held(tokens, model, settings):

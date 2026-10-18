@@ -2,7 +2,7 @@
 
 Run: make install / make uninstall. Installing copies build/auto-handoff to ~/.claude/hooks/, registers
 it for every hook event it handles, and allows writes to the handoff folder. Nothing else changes: the
-hook stays off until an auto-compact window is set with /autocompact (see README.md). What it changed
+hook runs only for models with an auto-compact window set with /autocompact (see README.md). What it changed
 is recorded next to the binary, so uninstalling undoes exactly that. settings.json is backed up first,
 and written in place: a symlinked settings.json stays a symlink and keeps its permissions.
 """
@@ -149,7 +149,8 @@ def main():
     print("%s.%s" % ("Uninstalled" if removing else "Installed",
                      " Backup of the previous settings: " + backup if backup else ""))
     if not removing:
-        print("It's off until you set an auto-compact window: /autocompact 333k starts it at about 300k tokens.")
+        print("It runs only for a model with an auto-compact window set: /autocompact 333k starts compaction at "
+              "about 300k tokens.")
 
 
 if __name__ == "__main__":

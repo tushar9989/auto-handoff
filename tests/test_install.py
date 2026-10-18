@@ -39,7 +39,7 @@ class InstallTest(unittest.TestCase):
                     "modelSettings": {"claude-opus-5-5": {"effortLevel": "xhigh", "autoCompactWindow": 1000000}}}
         self.write(original)
         out = self.run_install()
-        self.assertIn("off until you set an auto-compact window", out.stdout)
+        self.assertIn("only for a model with an auto-compact window", out.stdout)
         installed = self.read()
         self.assertEqual(len(installed["hooks"]["PreCompact"]), 1)
         self.assertEqual(installed["modelSettings"], original["modelSettings"])  # the window is the owner's

@@ -8,7 +8,7 @@ subagent.
 ## Install
 
 ```sh
-make install     # builds, tests and installs it, switched off
+make install     # builds, tests and installs it
 make uninstall   # removes exactly what install added
 ```
 
@@ -17,7 +17,8 @@ Installing registers the hook in `~/.claude/settings.json` (backed up first) and
 
 Switch it on in any session with `/autocompact 333k`. Compaction then starts about 33k below the
 window, at about 300k tokens; `/autocompact 733k` would start it at about 700k. The setting applies to
-the model you're using, in every session. `/autocompact auto` switches it off again.
+the model you're using, in every session. `/autocompact auto`, or a window above about 890k, switches it
+off again.
 
 ## How it works
 
@@ -31,14 +32,14 @@ the model you're using, in every session. `/autocompact auto` switches it off ag
    words, since the handoff has the details.
 4. **Load.** The fresh context opens with "A note from the user: make no mistakes. I love you.", then
    the handoff.
-5. **Safety limit.** 150k past the start (450k for a 300k start), compaction goes through without a
-   handoff rather than risk a failed request.
+5. **Safety limit.** 150k past the start (450k for a 300k start), or at 900k if that comes first,
+   compaction goes through without a handoff rather than risk a failed request.
 
 The handoff request asks for a rewrite rather than an append: where things stand now, finished work
 in at most 10 lines, lasting knowledge moved to the project's docs. A handoff over 9,000 characters is
 sent back once to be pruned. Loaded handoffs are archived in `~/.local/state/claude-handoffs/archive/`.
-A facts file is also saved beside each slot: the agent's last three messages word for word, and the
-git status.
+When the hook lets a compaction through, it also saves a facts file beside the slot: the last three
+messages the agent was given, word for word, and the git state.
 
 ## Which agent is compacting
 
@@ -64,13 +65,16 @@ lookup of the agent's id.
 - **Idle compaction** (a Claude Code default) compacts sessions of 200k or more when you come back after
   about an hour away. It saves re-reading the full context once the cache has expired, but it compacts
   below your threshold, usually without a handoff. You can turn it off in `/config`.
-- **Summary precompute** (also a default) writes the summary in advance, so it may not come out short.
-  If summaries look long, set `precomputeCompactionEnabled` to false.
+- **Summary precompute** writes the summary in the background before compaction is due. It's gated on
+  Anthropic's side and may not be active for you. Going by Claude Code 2.1.302's code, a compaction
+  that uses it never calls PreCompact, so nothing is held and no handoff is written. To be safe, set
+  `precomputeCompactionEnabled` to false.
 
 ## Limits
 
 - The hook reads only the window in `settings.json`, which is what `/autocompact` writes. It ignores
-  the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var and per-project windows.
+  the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var and per-project windows. A subagent whose definition
+  sets its own `autoCompactWindow` compacts without a handoff, and main may be held in its place.
 - Other PreCompact hooks run on every held attempt, so a slow one slows each request while a compaction
   waits.
 - A handoff still over 9,000 characters after one prune goes through as it is.

@@ -3,7 +3,7 @@ the hook holds compaction, gets a handoff written, and loads it afterwards.
 
 Run: make live, or python3 tests/live.py [scenario ...]
 (scenarios: main stop parallel project cycles)
-Costs roughly $0.50-1.50 per scenario on Sonnet. Re-run after Claude Code upgrades: the behaviour
+Costs $0.25-0.80 per scenario on Sonnet, about $3 for all five. Re-run after Claude Code upgrades: the behaviour
 these hooks rely on is mostly undocumented.
 """
 import glob
@@ -23,7 +23,7 @@ EVENTS = ["SessionStart", "SubagentStart", "SubagentStop", "UserPromptSubmit", "
 FOLLOW = "Follow any [auto-handoff] instructions you receive."
 
 # Every scenario compacts at about 67k tokens: a 100k window (the smallest Claude Code accepts) set for
-# the model in settings, as the installer sets it. Each file is about 12.9k tokens.
+# the model in settings, as /autocompact sets it. Each file is about 12.9k tokens.
 SCENARIOS = {
     # Compaction is held mid-turn, the agent is reminded, writes its handoff, and continues from it.
     "main": dict(turns=[
