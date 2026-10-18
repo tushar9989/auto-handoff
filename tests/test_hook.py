@@ -164,6 +164,34 @@ class HookTest(unittest.TestCase):
         self.hold()
         self.assertIn("compaction is waiting", self.ctx(self.tool()))
 
+    def settings(self, settings):
+        with open(os.path.join(self.config, "settings.json"), "w") as f:
+            json.dump(settings, f)
+
+    def test_off_until_a_window_is_set(self):
+        # Installed, but no window set (or the model's own): the hook says and holds nothing.
+        for settings in ({}, {"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 1000000}}},
+                         {"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": "auto"}}}):
+            self.tearDown()
+            self.setUp()
+            self.settings(settings)
+            self.assertEqual(self.ctx(self.run_hook("SessionStart", source="startup")), "")
+            self.assertEqual(self.ctx(self.run_hook("SubagentStart", "sub", agent_type="general-purpose")), "")
+            self.tokens("main", 970_000)
+            self.tool()
+            self.assertFalse(self.blocked(self.compact()))
+            self.assertEqual(self.returned(), "")  # no note, nothing loaded
+            self.assertIsNone(self.compact("manual"))
+            self.assertEqual(self.returned(), "")
+            self.assertEqual(self.agents(), {})
+
+    def test_on_once_a_window_is_set(self):
+        self.settings({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 333000}}})  # /autocompact 333k
+        os.remove(self.transcript)  # a new session: no transcript yet, so the settings decide
+        self.assertIn("main.md", self.ctx(self.run_hook("SessionStart", source="startup")))
+        self.tokens("main", 300_000)
+        self.hold()
+
     def test_handoff_written_before_waiting_is_stale(self):
         self.write_handoff("main", "Owner: main session - old")
         self.hold()
@@ -601,6 +629,11 @@ class HookTest(unittest.TestCase):
         self.assertFalse(held(300_000, "claude-opus-5-5", {}))  # nothing set: the model's own 1M window
         auto = {"autoCompactWindow": 333000, "modelSettings": {"claude-opus-5-5": {"autoCompactWindow": "auto"}}}
         self.assertFalse(held(300_000, "claude-opus-5-5", auto))  # "auto": the model's own 1M window
+        # /autocompact 733k: it starts at about 700k, and the safety limit follows, 150k later.
+        self.assertTrue(held(700_000, "claude-opus-5-5", ms("claude-opus-5-5", 733000)))
+        self.assertFalse(held(860_000, "claude-opus-5-5", ms("claude-opus-5-5", 733000)))
+        # "auto" starts at about 967k, past 90% of the window: never held.
+        self.assertFalse(held(970_000, "claude-opus-5-5", ms("claude-opus-5-5", "auto")))
 
     def test_plan_mode_is_not_held(self):
         self.run_hook("UserPromptSubmit", prompt="plan it", permission_mode="plan")

@@ -81,7 +81,7 @@ def run(name, spec, tmp, run_dir):
     }
     with open(os.path.join(tmp, name + ".settings.json"), "w") as f:
         json.dump(settings, f)
-    env = dict(os.environ, AUTO_HANDOFF_DIR=handoffs, AUTO_HANDOFF_LOG=log, AUTO_HANDOFF_CEILING="150000",
+    env = dict(os.environ, AUTO_HANDOFF_DIR=handoffs, AUTO_HANDOFF_LOG=log,
                AUTO_HANDOFF_SETTINGS=os.path.join(tmp, name + ".settings.json"))
     cmd = ["claude", "-p", "--model", "sonnet", "--strict-mcp-config", "--setting-sources", "project",
            "--settings", os.path.join(tmp, name + ".settings.json"), "--input-format", "stream-json",

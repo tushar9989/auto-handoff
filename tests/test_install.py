@@ -38,14 +38,13 @@ class InstallTest(unittest.TestCase):
         original = {"model": "opus", "hooks": {}, "permissions": {"allow": []},
                     "modelSettings": {"claude-opus-5-5": {"effortLevel": "xhigh", "autoCompactWindow": 1000000}}}
         self.write(original)
-        self.run_install()
+        out = self.run_install()
+        self.assertIn("off until you set an auto-compact window", out.stdout)
         installed = self.read()
-        self.assertEqual(installed["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"], 333000)
-        self.assertEqual(installed["modelSettings"]["claude-fable-5-1"]["autoCompactWindow"], 333000)
-        self.assertEqual(installed["modelSettings"]["claude-opus-4-8"]["autoCompactWindow"], 333000)
-        self.assertIs(installed["idleCompaction"], False)
-        self.assertIs(installed["precomputeCompactionEnabled"], False)
         self.assertEqual(len(installed["hooks"]["PreCompact"]), 1)
+        self.assertEqual(installed["modelSettings"], original["modelSettings"])  # the window is the owner's
+        for key in ("idleCompaction", "precomputeCompactionEnabled", "autoCompactWindow"):
+            self.assertNotIn(key, installed)
         self.run_install()  # idempotent
         self.assertEqual(self.read(), installed)
         self.run_install("--uninstall")
@@ -71,64 +70,25 @@ class InstallTest(unittest.TestCase):
     def test_uninstall_keeps_what_it_did_not_add(self):
         mine = {"hooks": [{"type": "command", "command": "~/bin/my-auto-handoff-notes"}]}
         rule = "Read(~/.local/state/claude-handoffs/**)"
-        self.write({"hooks": {"Stop": [mine]}, "permissions": {"allow": [rule]}, "idleCompaction": True})
+        self.write({"hooks": {"Stop": [mine]}, "permissions": {"allow": [rule]}})
         self.run_install()
         self.run_install("--uninstall")
         after = self.read()
         self.assertEqual(after["hooks"]["Stop"], [mine])
         self.assertEqual(after["permissions"]["allow"], [rule])
-        self.assertIs(after["idleCompaction"], True)
 
-    def test_uninstall_leaves_later_window_changes(self):
+    def test_settings_changed_after_install_are_kept(self):
         self.write({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 1000000}}})
         self.run_install()
         changed = self.read()
-        changed["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"] = 500000  # /autocompact 500k
-        self.write(changed)
-        self.run_install("--uninstall")
-        self.assertEqual(self.read()["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"], 500000)
-
-    def test_reinstall_keeps_later_changes(self):
-        self.write({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 1000000}}})
-        self.run_install()
-        changed = self.read()
-        changed["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"] = 500000
-        changed["idleCompaction"] = True
+        changed["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"] = 333000  # /autocompact 333k
+        changed["permissions"]["allow"].append("Bash(ls)")
         self.write(changed)
         self.run_install()  # say, after a rebuild
-        after = self.read()
-        self.assertEqual(after["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"], 500000)
-        self.assertIs(after["idleCompaction"], True)
-        self.run_install()
         self.run_install("--uninstall")
-        after = self.read()
-        self.assertEqual(after["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"], 500000)
-        self.assertIs(after["idleCompaction"], True)
-
-    def test_reinstall_after_restoring_the_backup_manages_again(self):
-        original = {"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 1000000}}, "idleCompaction": True}
-        self.write(original)
-        self.run_install()
-        self.write(original)  # the backup restored by hand
-        out = self.run_install()
         after = self.read()
         self.assertEqual(after["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"], 333000)
-        self.assertIs(after["idleCompaction"], False)
-        self.assertNotIn("Left as you set them", out.stdout)
-        self.run_install("--uninstall")
-        self.assertEqual(self.read(), original)
-
-    def test_reinstall_says_what_it_left(self):
-        self.write({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 1000000}}})
-        self.run_install()
-        changed = self.read()
-        changed["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"] = 500000
-        self.write(changed)
-        self.assertIn("Left as you set them since installing: claude-opus-5-5", self.run_install().stdout)
-        changed["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"] = 1000000  # back to the original
-        self.write(changed)
-        self.run_install()
-        self.assertEqual(self.read()["modelSettings"]["claude-opus-5-5"]["autoCompactWindow"], 333000)
+        self.assertEqual(after["permissions"]["allow"], ["Bash(ls)"])
 
     def test_reinstall_swaps_in_a_new_binary_file(self):
         self.write({"model": "opus"})
@@ -147,7 +107,7 @@ class InstallTest(unittest.TestCase):
 
     def test_bad_settings_are_left_alone(self):
         for text in ('{\n  "model": "opus",\n}\n', '{"hooks": {"Stop": ["oops"]}}', '{"permissions": {"allow": "Read"}}',
-                     '{"modelSettings": {"claude-opus-5-5": "auto"}}', "[]"):
+                     "[]"):
             with open(self.settings, "w") as f:
                 f.write(text)
             out = self.run_install(ok=False)

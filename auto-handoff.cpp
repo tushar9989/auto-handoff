@@ -48,7 +48,7 @@ extern char** environ;
 
 namespace {
 
-const double kCeiling = 450000;            // past this many tokens, compact without a handoff
+const double kHoldRoom = 150000;           // hold at most this far past the compaction point (450k at 300k)
 const double kDefaultWindow = 200000;      // unknown model: assume a small window so the limit errs early
 const double kWindowShare = 0.9;           // never hold past this share of the model's real window
 const double kTriggerGap = 33000;          // auto-compact fires about this far below its window
@@ -182,7 +182,6 @@ const char* kSummaryInstructions =
 
 struct Config {
   std::string root, log, config_dir, settings;
-  double ceiling = kCeiling;
 } cfg;
 
 // ---- A small JSON value: enough for hook input, transcript lines and our own state file.
@@ -992,26 +991,56 @@ double window(const std::string& model) {
   return kDefaultWindow;
 }
 
-// The auto-compact window set for a model in the user's settings: its modelSettings entry, which the
-// installer writes, else the top-level setting. "auto", or nothing set, is 0.
-double configured_window(const std::string& model) {
+const Json& settings() {
   static bool loaded = false;
-  static Json settings;
+  static Json parsed;
   if (!loaded) {
     loaded = true;
     std::string text;
-    if (read_file(cfg.settings, text)) Parser(text).parse(settings);
+    if (read_file(cfg.settings, text)) Parser(text).parse(parsed);
   }
-  const Json* ms = settings.get("modelSettings");
-  const Json* entry = ms ? ms->get(canonical(model)) : nullptr;
-  if (entry && entry->has("autoCompactWindow")) return entry->num("autoCompactWindow");
-  return settings.num("autoCompactWindow");
+  return parsed;
 }
 
-// Roughly where auto-compact fires for a model.
-double trigger_point(const std::string& model) {
-  double w = window(model), c = configured_window(model);
-  return (c > 0 ? std::min(w, c) : w) - kTriggerGap;
+// The auto-compact window set for a model in the user's settings (by /autocompact): its modelSettings
+// entry, else the top-level setting. "auto", or nothing set, is 0.
+double configured_window(const std::string& model) {
+  const Json* ms = settings().get("modelSettings");
+  const Json* entry = ms ? ms->get(canonical(model)) : nullptr;
+  if (entry && entry->has("autoCompactWindow")) return entry->num("autoCompactWindow");
+  return settings().num("autoCompactWindow");
+}
+
+// Roughly where auto-compact fires, given a model's own window and the one configured (0 for none).
+double trigger_for(double native, double configured) {
+  return (configured > 0 ? std::min(native, configured) : native) - kTriggerGap;
+}
+
+// The safety limit: past it, compaction goes through without a handoff.
+double limit_for(double native, double configured) {
+  return std::min(trigger_for(native, configured) + kHoldRoom, kWindowShare * native);
+}
+
+// Whether the hook is on: the compaction point leaves room to wait below the safety limit. That takes
+// a window set with /autocompact (up to about 890k on a 1M model). The model's own window ("auto", or
+// nothing set) puts the point past the limit, and so does a 200k model's: off.
+bool on_for(double native, double configured) {
+  return limit_for(native, configured) - trigger_for(native, configured) >= kMinRoom;
+}
+
+double trigger_point(const std::string& model) { return trigger_for(window(model), configured_window(model)); }
+double safety_limit(const std::string& model) { return limit_for(window(model), configured_window(model)); }
+bool holds(const std::string& model) { return on_for(window(model), configured_window(model)); }
+
+// Whether it's on for a session: by the model its transcript shows, else (a new session) by any window
+// in the settings that turns it on. SessionStart's own "model" field is often missing.
+bool session_on(const Json& in) {
+  std::string model = usage(in.str("transcript_path"), true).model;
+  if (!model.empty()) return holds(model);
+  if (const Json* ms = settings().get("modelSettings"))
+    for (const auto& f : ms->fields)
+      if (f.second.has("autoCompactWindow") && holds(f.first)) return true;
+  return on_for(1e6, settings().num("autoCompactWindow"));
 }
 
 bool planning(const std::string& d, const std::string& agent);
@@ -1023,7 +1052,7 @@ struct Candidate {
   AgentInfo info;
   double trigger = 0, limit = 0;
   bool at_limit = false;  // past the safety limit: never block
-  bool tight = false;     // its window leaves no room to hold it
+  bool on = false;        // the hook is on for its model (see holds)
 };
 
 // `announced` is the agent's own estimate of the request being made, if it gave one.
@@ -1034,9 +1063,9 @@ Candidate candidate(const std::string& d, const std::string& transcript, const s
   if (c.u.tokens > 0) c.u.tokens = std::max(c.u.tokens, announced);
   c.info = agent_info(d, agent);
   c.trigger = trigger_point(c.u.model);
-  c.limit = std::min(cfg.ceiling, kWindowShare * window(c.u.model));
+  c.limit = safety_limit(c.u.model);
   c.at_limit = c.u.tokens >= c.limit;
-  c.tight = c.limit - c.trigger < kMinRoom;
+  c.on = holds(c.u.model);
   return c;
 }
 
@@ -1261,6 +1290,7 @@ void after_compact(const Json& in, const std::string& d) {
     }
     save_state(d, st);
   }
+  if (handoffs.empty() && released.empty() && waiting.empty() && !session_on(in)) return;  // off
   log(d, "compacted: " + std::to_string(handoffs.size()) + " handoff(s) to load" +
              (forced ? ", one at the safety limit" : ""));
   // Kept out of the context on purpose: a git status can be long. One line says where they are.
@@ -1317,7 +1347,7 @@ void on_session_start(const Json& in, const std::string& d) {
     save_state(d, st);
   }
   if (src == "startup") prune();
-  context("SessionStart", replace_all(kAskedMain, "{path}", slot_path(d, "main")));
+  if (session_on(in)) context("SessionStart", replace_all(kAskedMain, "{path}", slot_path(d, "main")));
 }
 
 void on_subagent_start(const Json& in, const std::string& d, const std::string& agent) {
@@ -1327,7 +1357,8 @@ void on_subagent_start(const Json& in, const std::string& d, const std::string& 
   mkdirs(d + "/types");
   write_atomic(d + "/types/" + agent, type);
   log(d, "subagent " + agent + " (" + type + (read_only(type) ? ", read-only" : "") + ") started");
-  if (!read_only(type)) context("SubagentStart", replace_all(kAskedSubagent, "{path}", slot_path(d, agent)));
+  if (!read_only(type) && session_on(in))
+    context("SubagentStart", replace_all(kAskedSubagent, "{path}", slot_path(d, agent)));
 }
 
 void on_subagent_stop(const Json& in, const std::string& d, const std::string& agent) {
@@ -1507,7 +1538,7 @@ bool wants_hold(const std::string& d, const Json& st, const Candidate& c) {
   const Json* found = st.get("agents")->get(c.agent);
   const Json& a = found ? *found : none;
   if (a.has("released") || c.at_limit) return false;  // released: another attempt for the same compaction
-  if (c.info.readonly || c.tight || planning(d, c.agent)) return false;
+  if (c.info.readonly || planning(d, c.agent)) return false;
   return !ready(d, c.agent, a) || trimming(d, c.agent, a) || outgrown(c, a);
 }
 
@@ -1560,10 +1591,7 @@ std::string let_through(const std::string& d, Json& st, const Candidate& c, doub
     return unfinished || behind ? "" : summary_instructions(d, who);  // otherwise the full summary, as a fallback
   }
   // Agents that couldn't write a handoff, or have no room to: compact as usual.
-  std::string skip = c.info.readonly                  ? "read-only agent"
-                     : c.tight                        ? "window too small to hold"
-                     : planning(d, who)               ? "plan mode"
-                                                      : "";
+  std::string skip = c.info.readonly ? "read-only agent" : planning(d, who) ? "plan mode" : "";
   if (!skip.empty()) {
     release(d, who, a, "skipped", cwd);
     log(d, "compaction of " + who + " allowed: " + skip);
@@ -1578,6 +1606,7 @@ std::string let_through(const std::string& d, Json& st, const Candidate& c, doub
 void on_pre_compact(const Json& in, const std::string& d) {
   double t = now();
   if (in.str("trigger") == "manual") {  // /compact: always allowed; load a handoff if one was written
+    if (!session_on(in)) return;
     Lock lock(d);
     Json st = load_state(d);
     Json& a = st.get("agents")->at("main");
@@ -1592,6 +1621,7 @@ void on_pre_compact(const Json& in, const std::string& d) {
   Candidate c;
   if (!compacting(d, in.str("transcript_path"), t, c))
     return log(d, "compaction allowed: no agent is at its compaction point");
+  if (!c.on) return log(d, "compaction of " + c.agent + " allowed: the hook is off for its model");
   Lock lock(d);
   Json st = load_state(d);
   std::string cwd = st.str("cwd").empty() ? in.str("cwd") : st.str("cwd");
@@ -1635,7 +1665,6 @@ int main() {
   const char* home = getenv("HOME");
   const char* root = getenv("AUTO_HANDOFF_DIR");
   const char* logp = getenv("AUTO_HANDOFF_LOG");
-  const char* ceiling = getenv("AUTO_HANDOFF_CEILING");
   const char* config = getenv("CLAUDE_CONFIG_DIR");
   std::string h = home ? home : "";
   cfg.root = root && *root ? root : h + "/.local/state/claude-handoffs";
@@ -1643,7 +1672,6 @@ int main() {
   cfg.log = logp ? logp : "";
   const char* settings = getenv("AUTO_HANDOFF_SETTINGS");  // tests: a --settings file Claude Code was given
   cfg.settings = settings && *settings ? settings : cfg.config_dir + "/settings.json";
-  if (ceiling && *ceiling) cfg.ceiling = atof(ceiling);
 
   std::string text;
   char buf[65536];

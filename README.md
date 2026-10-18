@@ -6,8 +6,9 @@ clean point. The handoff is then loaded into the fresh context automatically.
 
 ## How it works
 
-1. Auto-compact is set to try at about 300k tokens (`autoCompactWindow: 333000`; it fires about 33k
-   below the window).
+1. You switch it on by setting an auto-compact window: `/autocompact 333k` makes compaction first try
+   at about 300k tokens (it fires about 33k below the window). Until then it does nothing (see
+   "Switching it on").
 2. When it tries, the hook (PreCompact) works out which agent is compacting. It holds the compaction
    and notes that this agent owes a handoff.
 3. On the agent's next batch of tool results or prompt, the hook asks it to finish the step it's on and write
@@ -40,9 +41,9 @@ clean point. The handoff is then loaded into the fresh context automatically.
 5. Right after compaction, the hook loads the handoff into the fresh context: inline up to 9.5k
    characters, otherwise as a path to read. Every message that returns from a compaction opens with
    "A note from the user: make no mistakes. I love you.", even when there's nothing to load.
-6. Safety limit: past 450k tokens (or 90% of the model's window) compaction goes through without a
-   handoff, with Claude Code's full default summary. Holding all the way to the real limit would make
-   the request fail.
+6. Safety limit: 150k tokens past the compaction point (450k when it starts at 300k), and never more
+   than 90% of the model's window. Past it, compaction goes through without a handoff, with Claude
+   Code's full default summary. Holding all the way to the real limit would make the request fail.
 
 ### Which agent is compacting
 
@@ -69,7 +70,7 @@ announce. If the latest response isn't in the transcript's last 256KB (say, afte
 results), the hook reads back further, up to 32MB.
 
 The compaction point is 33k below the window set for the model in `~/.claude/settings.json`: its
-`modelSettings` entry (the one the installer writes; dated, Bedrock and Vertex model names count),
+`modelSettings` entry (the one `/autocompact` writes; dated, Bedrock and Vertex model names count),
 else the top-level `autoCompactWindow`, else the model's own window. `"auto"` means the model's own
 window. Other ways of setting it (see Limits) aren't read; at worst, a compaction point the hook
 gets wrong means that compaction happens as usual, without a handoff.
@@ -142,9 +143,16 @@ files included. Handoffs being pruned also get a `_before-trim` copy.
   isn't asked.
 - Models with a 200k window aren't held. They compact only about 30k below their limit, which
   leaves no room to wait safely. They compact as usual, without a handoff.
-- Idle compaction and background summary precompute are turned off by the installer, because both
-  would compact behind the hook's back. If idle compaction is on anyway, it's held like any other
-  compaction, and the handoff is asked for at your next prompt.
+- Claude Code's idle compaction and background summary precompute are left as they are (both are on
+  unless you turn them off in `/config`):
+  - **Idle compaction** compacts a session of 200k tokens or more at your first request after about
+    54 minutes away, which saves re-reading the whole context at full price once the cache has
+    expired. It compacts below your threshold and without a handoff, unless the session is within
+    50k of its compaction point, when the hook holds it and asks for one. Turn it off if you'd rather
+    keep the detail across breaks.
+  - **Precompute** writes the summary in advance, so compaction is instant. A summary written in
+    advance probably can't follow the request to keep it short, so it may come out full length next
+    to the handoff. Turn it off if summaries come back long.
 
 The summary can't be switched off without switching off compaction entirely (`DISABLE_COMPACT`).
 Claude Code also keeps a recent stretch of messages word for word, and reloads CLAUDE.md, memory and
@@ -153,34 +161,42 @@ up to five recently used files. None of that can be configured.
 ## Install
 
 ```sh
-make install     # builds, runs the tests, installs
+make install     # builds, runs the tests, installs (off until you switch it on)
 make uninstall   # undoes what install changed
 ```
 
-Installing changes `~/.claude/settings.json`, after backing it up next to itself:
+Installing changes `~/.claude/settings.json`, after backing it up next to itself, and nothing else in
+it:
 
 - copies the binary to `~/.claude/hooks/auto-handoff` and registers it for seven hook events. A
   reinstall swaps in a new file rather than overwriting the old one: macOS can otherwise keep killing
   a binary that was rewritten while a hook was running it.
 - allows Read/Edit/Write on `~/.local/state/claude-handoffs/**`
-- sets `autoCompactWindow` to 333000 for every model family with a 1M window (Opus, Sonnet and
-  Haiku 5.5, Fable, Mythos, Opus 5, Opus 4.7 and 4.8)
-- sets `idleCompaction` and `precomputeCompactionEnabled` to false
 
-What it changed is recorded in `~/.claude/hooks/auto-handoff.install.json`:
-- **Uninstall** puts back only those values. Anything you've changed since, like a later
-  `/autocompact`, stays.
-- **Installing again** (say after a rebuild) keeps those later changes too, and says which values it
-  left alone. A value put back to what it was before the first install, for example by restoring a
-  backup, is managed again.
+What it added is recorded in `~/.claude/hooks/auto-handoff.install.json`:
+- **Uninstall** removes only that. Your auto-compact window and anything else you've changed stay.
 - **Your file is edited in place.** A symlinked `settings.json` stays a symlink and keeps its
   permissions.
 - **Only its own hook is removed.** A hook of yours that shares an entry with it stays.
 - **Unexpected settings are refused.** If `settings.json` isn't valid JSON or has an unexpected
   shape, nothing is changed and the script says where.
 
-The new settings also reach sessions that are already running. A running session past 450k tokens
-compacts at its next step without a handoff, so install between sessions.
+## Switching it on
+
+Installed, the hook does nothing: no messages, no holds, no note after compactions. It's on for a model
+once that model has an auto-compact window that leaves room to wait, up to about 890k on a 1M model.
+Run `/autocompact <window>` in a session: compaction starts about 33k below the window, so
+`/autocompact 333k` starts it at about 300k and `/autocompact 733k` at about 700k. That saves the
+window for the model you're using in your settings, so every session follows it, running ones
+included, and so does the hook. A session already past the new safety limit compacts at its next
+step without a handoff.
+
+The safety limit moves with it: 150k past the start, at most 90% of the window (450k for a start at
+300k, 850k for 700k).
+
+To switch it off again, run `/autocompact auto`: the model's own window starts compaction at about
+967k, past the safety limit, so compaction runs as it would without the hook. `make uninstall` removes
+it completely.
 
 Needs a C++17 compiler (Apple clang is fine) and Python 3 for the installer and tests.
 
@@ -194,11 +210,11 @@ allow rule.
 ## Tuning and debugging
 
 - Limits, timings and every message text are constants at the top of `auto-handoff.cpp`. The window
-  is in `install.py`.
+  is set with `/autocompact`.
 - `AUTO_HANDOFF_LOG=/path/to/file` logs every decision ("compaction of main held (301k tokens)",
   "nudge", "allowed: handoff"). Errors go to `~/.local/state/claude-handoffs/errors.log`.
-- `AUTO_HANDOFF_CEILING`, `AUTO_HANDOFF_DIR` and `AUTO_HANDOFF_SETTINGS` override the safety limit,
-  the folder and the settings file the window is read from.
+- `AUTO_HANDOFF_DIR` and `AUTO_HANDOFF_SETTINGS` override the folder and the settings file the window
+  is read from.
 - Speed:
   - The hook runs once per batch of tool calls, not once per call. Each run costs about 0.9ms on top
     of starting a process, reading the last 256KB of the agent's transcript.
@@ -258,7 +274,5 @@ of it undocumented:
   request while a compaction waits. Pruning a big handoff can take dozens of requests. Their
   SessionStart(compact) output can also come before the note.
 - **200k-window models** get no automatic handoff (see "Other cases").
-- **A window above about 440k** (say a later `/autocompact 500k`) puts the compaction point past the
-  450k safety limit, so the hook stops holding for that model. Raise `AUTO_HANDOFF_CEILING` with it.
 - **A compaction Claude Code starts after an API error** (an image or request too large) while a hold
   is on gets held too, and that one request fails. This hasn't shown up in practice.

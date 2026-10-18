@@ -1,12 +1,10 @@
 """Install or remove the auto-handoff hook in ~/.claude/settings.json.
 
-Run: make install / make uninstall. Installing copies build/auto-handoff to ~/.claude/hooks/,
-registers it for every hook event it handles, allows writes to the handoff folder, sets each model's
-auto-compact window so compaction first tries at about 300k tokens, and turns off idle compaction
-and background summary precompute (both compact behind the hook's back). What it changed is recorded
-next to the binary, so uninstalling undoes exactly that and leaves later changes alone; installing
-again (after a rebuild) keeps values changed since, like a later /autocompact. settings.json is backed
-up first, and written in place: a symlinked settings.json stays a symlink and keeps its permissions.
+Run: make install / make uninstall. Installing copies build/auto-handoff to ~/.claude/hooks/, registers
+it for every hook event it handles, and allows writes to the handoff folder. Nothing else changes: the
+hook stays off until an auto-compact window is set with /autocompact (see README.md). What it changed
+is recorded next to the binary, so uninstalling undoes exactly that. settings.json is backed up first,
+and written in place: a symlinked settings.json stays a symlink and keeps its permissions.
 """
 import json
 import os
@@ -21,14 +19,6 @@ BIN = os.path.join(CLAUDE, "hooks", "auto-handoff")
 RECORD = BIN + ".install.json"
 EVENTS = ["SessionStart", "SubagentStart", "SubagentStop", "UserPromptSubmit", "PostToolBatch", "Stop", "PreCompact"]
 PERMISSIONS = ["%s(~/.local/state/claude-handoffs/**)" % t for t in ("Read", "Edit", "Write")]
-# Auto-compact fires about 33k tokens below the window, so 333k first tries at about 300k.
-WINDOW = 333000
-# Every model family with a native 1M window, by the canonical names modelSettings uses.
-MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1", "claude-fable-5",
-          "claude-mythos-5-1", "claude-mythos-5", "claude-opus-5", "claude-sonnet-5", "claude-opus-4-8",
-          "claude-opus-4-7"]
-OFF = {"idleCompaction": False, "precomputeCompactionEnabled": False}
-ABSENT = "<absent>"
 
 
 def ours(entry):
@@ -52,9 +42,6 @@ def check(settings):
                 expect(h, dict, 'a hook in "hooks.%s"' % event)
     expect(settings.get("permissions", {}), dict, '"permissions"')
     expect(settings.get("permissions", {}).get("allow", []), list, '"permissions.allow"')
-    expect(settings.get("modelSettings", {}), dict, '"modelSettings"')
-    for model in MODELS:
-        expect(settings.get("modelSettings", {}).get(model, {}), dict, '"modelSettings.%s"' % model)
 
 
 def remove_hooks(settings):
@@ -83,25 +70,10 @@ def load_record():
 
 def install(settings):
     record = load_record() or {
-        "existed": {k: k in settings for k in ("hooks", "permissions", "modelSettings")},
+        "existed": {k: k in settings for k in ("hooks", "permissions")},
         "allow_existed": "allow" in settings.get("permissions", {}),
-        "added_allow": [], "windows": {}, "models_existed": {}, "settings": {},
+        "added_allow": [],
     }
-    # Values the user changed after an install are theirs from then on, until they're put back to what
-    # they were before the first install (say, by restoring a backup): then they're managed again.
-    record.setdefault("left", [])
-
-    def manage(name, current, original, ours):
-        if name in record["left"]:
-            if current != original:
-                return False
-            record["left"].remove(name)
-            return True
-        if current in (ours, original):
-            return True
-        record["left"].append(name)
-        return False
-
     # A new file, swapped in: overwriting the binary in place while a hook runs it can leave macOS
     # killing it on every later run (the kernel keeps the old code signature for that file).
     os.makedirs(os.path.dirname(BIN), exist_ok=True)
@@ -115,23 +87,8 @@ def install(settings):
     for rule in PERMISSIONS:
         if rule not in allow:
             allow.append(rule)
-            record["added_allow"].append(rule)
-    models = settings.setdefault("modelSettings", {})
-    for model in MODELS:
-        current = models.get(model, {}).get("autoCompactWindow")
-        if model not in record["windows"]:
-            record["models_existed"][model] = model in models
-            record["windows"][model] = current
-        if manage(model, current, record["windows"][model], WINDOW):
-            models.setdefault(model, {})["autoCompactWindow"] = WINDOW
-    if not models and not record["existed"]["modelSettings"]:
-        del settings["modelSettings"]
-    for key, value in OFF.items():
-        current = settings.get(key, ABSENT)
-        if key not in record["settings"]:
-            record["settings"][key] = current
-        if manage(key, current, record["settings"][key], value):
-            settings[key] = value
+            if rule not in record["added_allow"]:
+                record["added_allow"].append(rule)
     return record
 
 
@@ -148,26 +105,6 @@ def uninstall(settings):
                 del permissions["allow"]
         if permissions is not None and not permissions and not record["existed"]["permissions"]:
             del settings["permissions"]
-        models = settings.get("modelSettings", {})
-        for model, previous in record["windows"].items():
-            entry = models.get(model)
-            if entry is None or entry.get("autoCompactWindow") != WINDOW or model in record.get("left", []):
-                continue  # changed since install: leave it
-            if previous is None:
-                del entry["autoCompactWindow"]
-            else:
-                entry["autoCompactWindow"] = previous
-            if not entry and not record["models_existed"][model]:
-                del models[model]
-        if "modelSettings" in settings and not models and not record["existed"]["modelSettings"]:
-            del settings["modelSettings"]
-        for key, previous in record["settings"].items():
-            if settings.get(key) != OFF[key] or key in record.get("left", []):
-                continue
-            if previous == ABSENT:
-                del settings[key]
-            else:
-                settings[key] = previous
     return None
 
 
@@ -211,9 +148,8 @@ def main():
             json.dump(record, f, indent=2)
     print("%s.%s" % ("Uninstalled" if removing else "Installed",
                      " Backup of the previous settings: " + backup if backup else ""))
-    if record and record["left"]:
-        print("Left as you set them since installing: %s. Put them back to their values from before the first "
-              "install to have them managed again." % ", ".join(record["left"]))
+    if not removing:
+        print("It's off until you set an auto-compact window: /autocompact 333k starts it at about 300k tokens.")
 
 
 if __name__ == "__main__":
