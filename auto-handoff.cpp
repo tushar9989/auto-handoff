@@ -20,6 +20,19 @@
 //
 // Hooks run before every request, so this is a dependency-free native binary that skips the parts of
 // its input it doesn't need.
+//
+// Undocumented Claude Code behaviour it relies on, measured on 2.1.302 (re-run `make live` after upgrades):
+// - auto-compact is checked before every request, mid-turn too, and tried again at the next one after a
+//   PreCompact block;
+// - PostToolBatch carries agent_id and comes about 40ms before that agent's PreCompact. PreCompact and
+//   SessionStart(compact) carry no agent id (anthropics/claude-code#91910), and SessionStart's model is
+//   often missing;
+// - the check sizes the context as the last response's usage plus what's added since, at 3 bytes per
+//   token (4 for older models), 2,000 per image or document;
+// - each compaction writes a compact_boundary line into the compacted agent's own transcript;
+// - the summarizer doesn't see the most recent messages, which are kept word for word after it;
+// - PreCompact's plain stdout, when it doesn't block, is added to the summary prompt, for subagents too;
+// - hook context over 10,000 characters is moved to a file.
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -62,7 +75,7 @@ const double kStaleGrowth = 20000;         // a handoff the context has grown th
 const size_t kInjectCap = 9500;            // Claude Code moves hook context over 10,000 chars to a file
 const long kHandoffCap = 9000;             // a longer handoff holds compaction until it's trimmed
 const long kReadCap = 1 << 20;             // handoff files are read and archived up to this size
-const int kNudgeEvery = 5;                 // tool calls between reminders while a compaction waits
+const int kNudgeEvery = 5;                 // batches between reminders while a compaction waits
 const double kKeepDays = 14;
 const long kTranscriptNear = 256 << 10;    // bytes of transcript searched first for the latest usage
 const long kTranscriptTail = 4 << 20;      // searched next
