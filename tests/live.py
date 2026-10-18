@@ -19,8 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HOOK = os.path.abspath(os.path.join(HERE, "..", "build", "auto-handoff"))
 # Each run gets a fresh folder here, next to the real one; nothing is deleted.
 HANDOFFS = os.path.expanduser("~/.local/state/claude-handoffs-livetest")
-EVENTS = ["SessionStart", "SubagentStart", "SubagentStop", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure",
-          "PermissionDenied", "Stop", "PreCompact"]
+EVENTS = ["SessionStart", "SubagentStart", "SubagentStop", "UserPromptSubmit", "PostToolBatch", "Stop", "PreCompact"]
 FOLLOW = "Follow any [auto-handoff] instructions you receive."
 
 # Every scenario compacts at about 67k tokens: a 100k window (the smallest Claude Code accepts) set for
@@ -162,7 +161,7 @@ def check(name, out):
         sizes = summary_lengths(out["main_transcript"])
         expect(sizes and max(sizes) < 2000, "short summary (%s chars; about 2,200-3,600 by default)" % sizes)
     if name == "main":
-        expect("PostToolUse nudge for main" in log, "nudged mid-turn")
+        expect("PostToolBatch nudge for main" in log, "nudged mid-turn")
         facts = out["facts"].get("main.facts.md", "")
         expect("Read f01.txt through f08.txt" in facts, "facts file holds the user's request word for word")
         expect("main.facts.md" in out["main_transcript"], "facts file named after compaction")

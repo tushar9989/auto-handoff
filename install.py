@@ -19,8 +19,7 @@ CLAUDE = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
 SETTINGS = os.path.join(CLAUDE, "settings.json")
 BIN = os.path.join(CLAUDE, "hooks", "auto-handoff")
 RECORD = BIN + ".install.json"
-EVENTS = ["SessionStart", "SubagentStart", "SubagentStop", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure",
-          "PermissionDenied", "Stop", "PreCompact"]
+EVENTS = ["SessionStart", "SubagentStart", "SubagentStop", "UserPromptSubmit", "PostToolBatch", "Stop", "PreCompact"]
 PERMISSIONS = ["%s(~/.local/state/claude-handoffs/**)" % t for t in ("Read", "Edit", "Write")]
 # Auto-compact fires about 33k tokens below the window, so 333k first tries at about 300k.
 WINDOW = 333000

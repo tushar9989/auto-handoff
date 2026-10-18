@@ -10,7 +10,7 @@ clean point. The handoff is then loaded into the fresh context automatically.
    below the window).
 2. When it tries, the hook (PreCompact) works out which agent is compacting. It holds the compaction
    and notes that this agent owes a handoff.
-3. On the agent's next tool result or prompt, the hook asks it to finish the step it's on and write
+3. On the agent's next batch of tool results or prompt, the hook asks it to finish the step it's on and write
    its handoff. If a turn ends first, the Stop hook asks for it then. Each agent has a slot,
    `<session>/<agent>.md`:
    - **Main session with its own handoff file:** a session that already keeps one (say a
@@ -42,26 +42,26 @@ clean point. The handoff is then loaded into the fresh context automatically.
 
 ### Which agent is compacting
 
-Claude Code's compaction hooks don't say which agent is compacting, so the hook decides as follows:
-- It takes the agent active in the last 2 seconds whose context is within 50k tokens of its own
-  compaction point.
-- Failing that, it takes the largest context near its point among agents active in the last 20
-  minutes.
-- If no agent is near its point, it doesn't hold.
-- Agents whose size is unknown, and agents whose transcript shows they were just compacted, are
-  never chosen. If the latest response isn't in the transcript's last 4MB (say, after many large
-  images), the hook reads back further.
-- Sometimes the likeliest agent can't be held, while another candidate is within 10k of its own
-  compaction point. Agents that can't be held are Explore and Plan agents, the main session in plan
-  mode, agents with a small window, and agents already released. In that case the attempt is held once,
-  without recording anything:
-  - if the other agent is the one compacting, its retry comes right after its own tool call, which
-    makes it the clear pick;
-  - if the first agent is the likeliest again, it goes through.
+Claude Code's compaction hooks don't say which agent is compacting (issue
+[#91910](https://github.com/anthropics/claude-code/issues/91910)), so each agent announces itself:
+- **Before every request**, Claude Code checks whether the context has reached the compaction point.
+  It sizes the context as the last response's input and output, plus everything added since, at
+  3 bytes per token (4 for older models), with 2,000 tokens for each image or document.
+- **The hook does the same sum** on the events just before a request, which do say who the agent is.
+  Those events are a batch of tool results (PostToolBatch, with the results themselves), a new prompt,
+  and a Stop the hook blocks. If the agent's next request reaches its compaction point (less 3k for
+  small extras), the hook writes `<session>/crossing/<agent>`.
+- **PreCompact follows within milliseconds**, so the agents that announced in the last 5 seconds are
+  the ones compacting. That's one agent, unless several cross their points at the same moment.
+  Several are all held if any of them is waiting for its handoff, and are all let through otherwise.
+- **If nobody announced**, the main session is the candidate when it's within 50k of its point.
+  Examples are idle compaction and a message no hook saw arrive.
+- An attempt is never blocked when any candidate is past its safety limit or has a small window:
+  blocking either one could make a request fail.
 
-  So the first agent loses at most one request, and no hold is charged to anyone.
-- An attempt is never blocked when any candidate is past its safety limit, or is a small-window
-  agent within 20k of its compaction point. Blocking either one could make a request fail.
+Agents whose transcript shows they were just compacted have a small size again, so they don't
+announce. If the latest response isn't in the transcript's last 256KB (say, after large tool
+results), the hook reads back further, up to 32MB.
 
 The compaction point is 33k below the window set for the model in `~/.claude/settings.json`: its
 `modelSettings` entry (the one the installer writes; dated, Bedrock and Vertex model names count),
@@ -69,10 +69,9 @@ else the top-level `autoCompactWindow`, else the model's own window. `"auto"` me
 window. Other ways of setting it (see Limits) aren't read; at worst, a compaction point the hook
 gets wrong means that compaction happens as usual, without a handoff.
 
-The context size is the last response's input plus its output. Workflow agents' transcripts are
-found wherever they live.
+Workflow agents' transcripts are found wherever they live.
 
-When the pick is wrong, nothing is lost:
+When several agents cross together, or a guess goes wrong, nothing is lost:
 - **The summary stays full.** The summarizer only shortens it when the conversation being compacted
   names that handoff's slot, and no other agent is ever told it.
 - **Every loaded handoff says whose it is** ("the main session", "a subagent (pixel-builder)"), and
@@ -156,7 +155,7 @@ make uninstall   # undoes what install changed
 
 Installing changes `~/.claude/settings.json`, after backing it up next to itself:
 
-- copies the binary to `~/.claude/hooks/auto-handoff` and registers it for nine hook events. A
+- copies the binary to `~/.claude/hooks/auto-handoff` and registers it for seven hook events. A
   reinstall swaps in a new file rather than overwriting the old one: macOS can otherwise keep killing
   a binary that was rewritten while a hook was running it.
 - allows Read/Edit/Write on `~/.local/state/claude-handoffs/**`
@@ -196,9 +195,10 @@ allow rule.
 - `AUTO_HANDOFF_CEILING`, `AUTO_HANDOFF_DIR` and `AUTO_HANDOFF_SETTINGS` override the safety limit,
   the folder and the settings file the window is read from.
 - Speed:
-  - Each call costs about 0.7ms on top of starting a process.
-  - Most calls only touch one file; state is locked and rewritten only while a compaction waits.
-  - Tool output in the hook's input isn't parsed, so a 26MB Edit of a JSON file adds about 10ms.
+  - The hook runs once per batch of tool calls, not once per call. Each run costs about 0.9ms on top
+    of starting a process, reading the last 256KB of the agent's transcript.
+  - State is locked and rewritten only while a compaction waits.
+  - Tool results in the hook's input are measured, not parsed: 2MB of them adds about 1ms.
 
 ## Tests
 
@@ -219,8 +219,10 @@ of it undocumented:
 - Auto-compact is checked before every model request, mid-turn included, and a held compaction is
   retried at the next one.
 - PreCompact and SessionStart(compact) carry no agent id or permission mode. PreCompact follows the
-  compacting agent's PostToolUse within milliseconds, and SessionStart(compact) context reaches the
-  agent that compacted.
+  compacting agent's PostToolBatch (which carries the id and the tool results) by about 40ms, and
+  SessionStart(compact) context reaches the agent that compacted.
+- The compaction check sizes the context the way "Which agent is compacting" describes (read in
+  2.1.302's code, and matching every batch in a live probe).
 - Each compaction writes a `compact_boundary` line into the compacted agent's own transcript.
 - The summarizer sees only the earlier part of the conversation. A recent stretch is kept word for
   word after the summary, so the summarizer never sees the handoff being written.
@@ -232,11 +234,13 @@ of it undocumented:
 
 ## Limits
 
-- **Two agents at once:** if two agents both near their compaction points act within 2 seconds of
-  each other, the hold or release can land on the wrong one. See "Which agent is compacting" for how
-  that's recovered.
-- **Blocked tool calls:** a tool call that another PreToolUse hook blocks leaves no event behind. The
-  agent that made it is then found by size alone.
+- **Two agents crossing at once** are handled together: one may wait for the other's handoff, or be
+  let through with it. See "Which agent is compacting" for how that's recovered.
+- **Requests no hook announces** fall back to the main session when it's near its compaction point.
+  These are a subagent's first request with a large inherited context, and messages that arrive
+  without a prompt event. A subagent's compaction there goes through without its handoff. If main is
+  near its point at that moment, main is asked for its handoff early instead, and the subagent's
+  compaction waits until its next request, which it does announce.
 - **Settings the hook doesn't read:** `CLAUDE_CODE_AUTO_COMPACT_WINDOW`,
   `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, a subagent definition's own `autoCompactWindow`, a project's own
   setting, one passed with `--settings`, and windows tuned by the server. Agents they apply to may

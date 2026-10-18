@@ -74,8 +74,10 @@ class HookTest(unittest.TestCase):
     def ctx(self, out):
         return (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
 
-    def tool(self, agent=None):
-        return self.run_hook("PostToolUse", agent, tool_name="Read", tool_input={"file_path": "x"})
+    def tool(self, agent=None, response="ok"):
+        """A batch of tool calls just finished: the agent's next request follows."""
+        return self.run_hook("PostToolBatch", agent, tool_calls=[
+            {"tool_name": "Read", "tool_input": {"file_path": "x"}, "tool_use_id": "toolu_1", "tool_response": response}])
 
     def compact(self, trigger="auto"):
         return self.run_hook("PreCompact", trigger=trigger, custom_instructions=None)
@@ -104,9 +106,9 @@ class HookTest(unittest.TestCase):
         with open(p) as f:
             return json.load(f)["agents"]
 
-    def age(self, agent, seconds):
-        """Make an agent's last activity look this many seconds old."""
-        p = os.path.join(self.d, "events", agent)
+    def age(self, agent, seconds, what="events"):
+        """Make an agent's last activity (or its announcement, with what="crossing") look this old."""
+        p = os.path.join(self.d, what, agent)
         os.utime(p, (time.time() - seconds, time.time() - seconds))
 
     def archived(self):
@@ -222,7 +224,7 @@ class HookTest(unittest.TestCase):
         self.append("main", {"type": "assistant", "isApiErrorMessage": True, "message": {
             "model": "<synthetic>", "usage": {"input_tokens": 0, "cache_read_input_tokens": 0}}})
         self.hold()
-        self.assertEqual(self.agents()["main"]["tokens"], 300_000)
+        self.assertEqual(self.agents()["main"]["tokens"] // 1000, 300)  # the size of the next request
 
     def test_manual_compact(self):
         self.tool()
@@ -284,26 +286,40 @@ class HookTest(unittest.TestCase):
         self.assertIn("pending", self.agents()["main"])
         self.assertNotIn("agentNew", self.agents())
 
-    def test_denied_tool_falls_back_to_largest_context(self):
-        # A denied or slow tool call leaves no fresh event: pick the largest context near its trigger.
+    def test_old_announcement_is_ignored(self):
+        # An agent that announced but didn't compact (it finished, or the estimate was off) is no
+        # longer a candidate a few seconds later.
         self.tokens("main", 40_000)
         self.tokens("agentA", 300_000)
-        self.tool()
         self.tool("agentA")
-        self.age("agentA", 30)
-        self.age("main", 10)
-        self.assertTrue(self.blocked(self.compact()))
-        self.assertIn("pending", self.agents()["agentA"])
-        self.assertNotIn("main", self.agents())
+        self.age("agentA", 30, what="crossing")
+        self.assertFalse(self.blocked(self.compact()))
+        self.assertNotIn("agentA", self.agents())
 
-    def test_failed_tool_counts_as_activity(self):
+    def test_batch_results_count_toward_the_next_request(self):
+        self.tokens("main", 50_000)
+        self.tokens("agentA", 280_000)  # 17k below its 297k announcing point
+        self.tool("agentA", response="x" * 30_000)  # 10k tokens: still below
+        self.assertFalse(self.blocked(self.compact()))
+        self.tool("agentA", response=[{"type": "image", "source": {"data": "A" * 300_000}}])  # an image is 2k
+        self.assertFalse(self.blocked(self.compact()))
+        self.tool("agentA", response=[{"type": "text", "text": "x" * 60_000}])  # 20k tokens: crossing
+        self.assertTrue(self.blocked(self.compact()))
+        self.assertEqual(self.agents()["agentA"]["tokens"] // 1000, 300)  # the size of the next request
+
+    def test_failed_tool_in_a_batch_still_announces(self):
+        self.tokens("main", 50_000)
         self.tokens("agentA", 300_000)
-        self.tool()
-        self.age("main", 30)
-        self.run_hook("PostToolUseFailure", "agentA", tool_name="Bash", error="exit 1")
+        self.run_hook("PostToolBatch", "agentA", tool_calls=[
+            {"tool_name": "Bash", "tool_input": {"command": "false"}, "tool_use_id": "t1", "tool_response": "Exit code 1"},
+            {"tool_name": "Read", "tool_input": {"file_path": "y"}, "tool_use_id": "t2", "tool_response": "ok"}])
         self.assertTrue(self.blocked(self.compact()))
         self.assertIn("pending", self.agents()["agentA"])
-        self.assertIsNone(self.run_hook("PostToolUseFailure", "agentA", tool_name="Bash", error="x"))
+
+    def test_prompt_counts_toward_the_next_request(self):
+        self.tokens("main", 280_000)
+        self.run_hook("UserPromptSubmit", prompt="here is a big paste:\n" + "p" * 60_000)
+        self.assertTrue(self.blocked(self.compact()))
 
     def test_workflow_agent_transcript_is_found(self):
         self.tokens("main", 50_000)
@@ -360,11 +376,11 @@ class HookTest(unittest.TestCase):
         self.compact()
         self.assertIn("If that's you, continue from it; if it isn't, ignore it", self.returned())
 
-    def test_wrong_pick_is_recovered(self):
-        # main's handoff is ready, but a subagent near its own trigger acts in the moment before main's
-        # PreCompact, so main's compaction is released under the subagent's name.
+    def test_crossing_together_releases_both_and_recovers(self):
+        # main and a subagent both announce, both with their handoffs ready: both are released, and the
+        # one that didn't compact goes back to waiting.
         self.tokens("main", 310_000)
-        self.tokens("sub", 262_000)
+        self.tokens("sub", 300_000)
         self.run_hook("SubagentStart", "sub", agent_type="builder")
         self.hold("sub")
         self.write_handoff("sub", "Owner: subagent - SUB TASK")
@@ -373,14 +389,14 @@ class HookTest(unittest.TestCase):
         self.tool()
         self.tool("sub")
         out = self.compact()
-        # The summarizer only shortens the summary if it sees this handoff being written.
-        self.assertIn("If this conversation names " + os.path.join(self.d, "sub.md"),
-                      out["text"])
+        # Each summarizer only shortens the summary if its conversation names its own slot.
+        self.assertIn("If this conversation names " + os.path.join(self.d, "sub.md"), out["text"])
+        self.assertIn("If this conversation names " + os.path.join(self.d, "main.md"), out["text"])
         injected = self.returned("main")
+        self.assertIn("YOUR handoff", injected)
+        self.assertIn("MAIN TASK", injected)
         self.assertIn("SUB TASK", injected)
-        self.assertIn("ready but weren't loaded here", injected)
-        self.assertIn("main.md, for the main session", injected)  # main can find its own
-        self.assertIn("read " + os.path.join(self.d, "main.md"), self.ctx(self.tool()))  # and is told again
+        self.tool()
         self.assertNotIn("pending", self.agents()["main"])
         self.tool("sub")  # the subagent wasn't compacted, so it waits again with its handoff
         self.assertIn("pending", self.agents()["sub"])
@@ -395,34 +411,22 @@ class HookTest(unittest.TestCase):
         self.tokens(agent, tokens)
         self.run_hook("SubagentStart", agent, agent_type="Explore")
 
-    def test_agent_that_cant_be_held_doesnt_let_another_through(self):
+    def test_crossing_together_holds_for_the_one_that_owes(self):
         self.tokens("main", 301_000)
-        self.explore("exp", 280_000)
+        self.explore("exp", 300_000)
         self.tool()
-        self.tool("exp")  # the read-only agent acts last, but main is at its compaction point too
-        self.assertTrue(self.blocked(self.compact()))  # held once to see who retries
-        self.assertNotIn("main", self.agents())  # nothing recorded, no hold counted
-        self.tool()  # it was main: its retry follows its own tool call
+        self.tool("exp")  # the read-only agent acts last, but main crosses its compaction point too
         self.assertTrue(self.blocked(self.compact()))
         self.assertIn("pending", self.agents()["main"])
         self.assertNotIn("exp", self.agents())
 
-    def test_agent_that_cant_be_held_is_held_only_once(self):
-        self.tokens("main", 301_000)
-        self.explore("exp", 280_000)
-        self.tool()
-        self.tool("exp")
-        self.assertTrue(self.blocked(self.compact()))
-        self.tool("exp")  # it was the read-only agent: it's the likeliest again, so it goes through
-        self.assertFalse(self.blocked(self.compact()))
-        self.assertNotIn("main", self.agents())
-
-    def test_agent_not_at_its_point_is_no_stand_in(self):
-        self.tokens("main", 275_000)  # near its 300k point, but not at it
+    def test_agent_below_its_point_is_not_a_candidate(self):
+        self.tokens("main", 275_000)  # near its 300k point, but its next request doesn't cross it
         self.explore("exp", 301_000)
         self.tool()
         self.tool("exp")
         self.assertFalse(self.blocked(self.compact()))
+        self.assertNotIn("main", self.agents())
 
     def test_alone_an_agent_that_cant_be_held_goes_through(self):
         self.tokens("main", 50_000)
@@ -430,7 +434,7 @@ class HookTest(unittest.TestCase):
         self.tool("exp")
         self.assertFalse(self.blocked(self.compact()))
 
-    def test_released_agent_doesnt_let_another_through(self):
+    def test_crossing_together_waits_for_both_handoffs(self):
         self.tokens("main", 50_000)
         self.tokens("A", 305_000)
         self.tokens("B", 302_000)
@@ -438,15 +442,30 @@ class HookTest(unittest.TestCase):
         self.write_handoff("A", "Owner: subagent A")
         self.tool("B")
         self.tool("A")
-        self.assertTrue(self.shortens_summary(self.compact()))  # A released, and being summarized
-        self.assertTrue(self.blocked(self.compact()))  # B's attempt, with A's event still the newest
-        self.tool("B")  # B's retry follows its own tool call
-        self.assertTrue(self.blocked(self.compact()))
+        self.assertTrue(self.blocked(self.compact()))  # B crosses too and owes its handoff
         self.assertIn("pending", self.agents()["B"])
+        self.assertNotIn("released", self.agents()["A"])
+        self.write_handoff("B", "Owner: subagent B")
+        self.tool("B")
+        self.tool("A")
+        out = self.compact()
+        self.assertTrue(self.shortens_summary(out))
+        self.assertIn(os.path.join(self.d, "A.md"), out["text"])
+        self.assertIn(os.path.join(self.d, "B.md"), out["text"])
+
+    def test_released_agent_is_let_through_again(self):
+        self.tokens("main", 50_000)
+        self.tokens("A", 305_000)
+        self.hold("A")
+        self.write_handoff("A", "Owner: subagent A")
+        self.tool("A")
+        self.assertTrue(self.shortens_summary(self.compact()))
+        self.tool("A")  # the same compaction, tried again before it ran
+        self.assertTrue(self.shortens_summary(self.compact()))
 
     def test_small_window_agent_near_its_trigger_is_never_blocked(self):
         self.tokens("main", 301_000)
-        self.tokens("h", 160_000, model="claude-haiku-4-5")  # 167k trigger: it may be the one compacting
+        self.tokens("h", 165_000, model="claude-haiku-4-5")  # crosses its 167k trigger with main
         self.tool()
         self.tool("h")
         self.assertFalse(self.blocked(self.compact()))
@@ -470,7 +489,6 @@ class HookTest(unittest.TestCase):
         self.hold()
         self.write_handoff("main", "Owner: main session - MINE")
         self.returned("main")  # compacted, but its handoff wasn't released
-        self.assertIsNone(self.run_hook("PostToolUseFailure", tool_name="Bash", error="x"))
         self.assertIn("read " + os.path.join(self.d, "main.md"), self.ctx(self.tool()))
         self.assertEqual(self.ctx(self.tool()), "")  # said once
         self.assertEqual(len(self.archived()), 1)
@@ -480,7 +498,7 @@ class HookTest(unittest.TestCase):
             for _ in range(8):  # image tool results after the last response, 650KB each
                 f.write(json.dumps({"type": "user", "message": {"content": [{"type": "image", "data": "A" * 650_000}]}}) + "\n")
         self.hold()
-        self.assertEqual(self.agents()["main"]["tokens"], 300_000)
+        self.assertEqual(self.agents()["main"]["tokens"] // 1000, 300)  # the size of the next request
 
     def test_subagent_slot_never_points_at_a_file(self):
         handoff = self.project_handoff("# Shared handoff\n" + "z" * 20_000)
@@ -840,15 +858,15 @@ class HookTest(unittest.TestCase):
         self.assertIsNone(self.run_hook("SubagentStop", "helper", agent_type=""))
 
     def test_bad_input_never_fails(self):
-        for bad in ("not json", "{", '{"hook_event_name": "PostToolUse", "session_id": "../../etc"}', "[]", ""):
+        for bad in ("not json", "{", '{"hook_event_name": "PostToolBatch", "session_id": "../../etc"}', "[]", ""):
             self.assertIsNone(self.run_raw(bad))
 
     def test_large_tool_output_is_skipped_quickly(self):
         self.hold()
-        big = json.dumps({"session_id": SID, "transcript_path": self.transcript, "cwd": "/work",
-                          "tool_input": {"content": "a\\\"b" * 1_000_000},
-                          "tool_response": {"nested": [{"x": "y" * 1000}] * 5000, "s": "\\u00e9\\" * 10},
-                          "hook_event_name": "PostToolUse"})
+        big = json.dumps({"session_id": SID, "transcript_path": self.transcript, "cwd": "/work", "tool_calls": [
+                              {"tool_input": {"content": "a\\\"b" * 1_000_000},
+                               "tool_response": {"nested": [{"x": "y" * 1000}] * 5000, "s": "\\u00e9\\" * 10}}],
+                          "hook_event_name": "PostToolBatch"})
         start = time.time()
         out = self.run_raw(big)
         self.assertLess(time.time() - start, 0.5)
