@@ -18,7 +18,7 @@ SETTINGS = os.path.join(CLAUDE, "settings.json")
 BIN = os.path.join(CLAUDE, "hooks", "auto-handoff")
 RECORD = BIN + ".install.json"
 EVENTS = ["SessionStart", "SubagentStart", "SubagentStop", "UserPromptSubmit", "PostToolBatch", "Stop", "PreCompact"]
-PERMISSIONS = ["%s(~/.local/state/claude-handoffs/**)" % t for t in ("Read", "Edit", "Write")]
+PERMISSIONS = ["%s(~/.local/state/claude-handoffs/**)" % t for t in ("Read", "Edit")]  # Edit rules cover Write
 
 
 def ours(entry):
@@ -84,6 +84,10 @@ def install(settings):
     for event in EVENTS:
         hooks.setdefault(event, []).append({"hooks": [{"type": "command", "command": BIN, "timeout": 10}]})
     allow = settings.setdefault("permissions", {}).setdefault("allow", [])
+    for rule in [r for r in record["added_allow"] if r not in PERMISSIONS]:  # added by an older version
+        if rule in allow:
+            allow.remove(rule)
+        record["added_allow"].remove(rule)
     for rule in PERMISSIONS:
         if rule not in allow:
             allow.append(rule)

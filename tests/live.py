@@ -76,7 +76,7 @@ def run(name, spec, tmp, run_dir):
     log = os.path.join(tmp, name + ".log")
     settings = {
         "hooks": {e: [{"hooks": [{"type": "command", "command": HOOK, "timeout": 10}]}] for e in EVENTS},
-        "permissions": {"allow": ["%s(~/.local/state/claude-handoffs-livetest/**)" % t for t in ("Read", "Edit", "Write")]},
+        "permissions": {"allow": ["%s(~/.local/state/claude-handoffs-livetest/**)" % t for t in ("Read", "Edit")]},
         "modelSettings": {"claude-sonnet-5-5": {"autoCompactWindow": 100000}},
     }
     with open(os.path.join(tmp, name + ".settings.json"), "w") as f:
@@ -87,7 +87,7 @@ def run(name, spec, tmp, run_dir):
            "--settings", os.path.join(tmp, name + ".settings.json"), "--input-format", "stream-json",
            "--output-format", "stream-json", "--verbose", "--allowedTools", "Read", "Agent", "Task"]
     if spec.get("project_handoff"):
-        cmd += ["Edit(docs/**)", "Write(docs/**)"]  # a real session edits its project files
+        cmd += ["Edit(docs/**)"]  # a real session edits its project files
     p = subprocess.Popen(cmd, cwd=work, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     out = {"results": [], "boundaries": 0, "cost": 0.0, "session": None, "denials": []}
     for turn in spec["turns"]:

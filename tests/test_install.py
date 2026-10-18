@@ -99,6 +99,25 @@ class InstallTest(unittest.TestCase):
         self.assertNotEqual(os.stat(binary).st_ino, first)  # never rewritten in place
         self.assertFalse(os.path.exists(binary + ".new"))
 
+    def test_rules_an_older_install_added_are_dropped(self):
+        # Older installs also added a Write rule, which Claude Code warns about: Edit rules cover Write.
+        old = "Write(~/.local/state/claude-handoffs/**)"
+        self.write({"model": "opus"})
+        self.run_install()
+        installed = self.read()
+        installed["permissions"]["allow"].append(old)
+        self.write(installed)
+        record = os.path.join(self.config, "hooks", "auto-handoff.install.json")
+        with open(record) as f:
+            kept = json.load(f)
+        kept["added_allow"].append(old)
+        with open(record, "w") as f:
+            json.dump(kept, f)
+        self.run_install()
+        self.assertNotIn(old, self.read()["permissions"]["allow"])
+        self.run_install("--uninstall")
+        self.assertEqual(self.read(), {"model": "opus"})
+
     def test_no_settings_file(self):
         self.run_install()
         self.assertIn("PreCompact", self.read()["hooks"])
