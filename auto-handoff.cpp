@@ -65,7 +65,6 @@ const long kHandoffCap = 9000;             // a longer handoff holds compaction 
 const long kReadCap = 1 << 20;             // handoff files are read and archived up to this size
 const int kNudgeEvery = 5;                 // tool calls between reminders while a compaction waits
 const double kIdleSeconds = 20 * 60;       // a compaction this long after the last activity is idle compaction
-const double kClearLinkSeconds = 120;      // SessionEnd(clear) and the new session's start are this close
 const double kKeepDays = 14;
 const long kTranscriptTail = 4 << 20;      // bytes of transcript searched for the latest usage
 const long kTranscriptDeep = 32 << 20;     // searched instead when the tail has none (say, many images)
@@ -77,7 +76,7 @@ const double kGitSeconds = 2;              // a git command taking longer is ski
 // Families with a native 1M window (from 2.1.302's model table); anything else is assumed 200k.
 const char* kMillionWindow[] = {"claude-opus-5",   "claude-sonnet-5", "claude-haiku-5-5", "claude-fable-5",
                                 "claude-mythos-5", "claude-opus-4-7", "claude-opus-4-8"};
-// Built-in agent types that can't write files; custom ones are read from their definitions.
+// Built-in agent types that are told not to change files, so they can't be asked for a handoff.
 const char* kReadOnlyTypes[] = {"Explore", "Plan"};
 
 // The note opens every message that brings an agent back from a compaction or /clear.
@@ -96,8 +95,7 @@ const char* kNudge =
     "Housekeeping, so the handoff stays small however long the session runs:\n"
     "- Rewrite it rather than append to it. An earlier handoff in your context is material to prune, not a "
     "base to add to.\n"
-    "- Record where things stand now, not the history: earlier versions are kept (in {archive}; a committed "
-    "handoff file is left to git history). Collapse finished work into a \"Done so far\" list of at most 10 "
+    "- Record where things stand now, not the history: earlier versions are kept in {archive}. Collapse finished work into a \"Done so far\" list of at most 10 "
     "one-line entries, merging the oldest as it grows.\n"
     "- Drop what no longer matters: resolved questions, superseded decisions, files no longer involved, "
     "dead ends nobody will retry. Keep a failure only if it would otherwise be repeated.\n"
@@ -769,25 +767,6 @@ bool slot_ready(const std::string& d, const std::string& agent, double since) {
   return !read_handoff(slot).empty() && pointer(d, agent).empty();
 }
 
-int git(const std::string& dir, const std::vector<std::string>& args) {
-  std::vector<std::string> all = {"git", "--no-optional-locks", "-C", dir};
-  all.insert(all.end(), args.begin(), args.end());
-  std::vector<char*> argv;
-  for (auto& a : all) argv.push_back(&a[0]);
-  argv.push_back(nullptr);
-  posix_spawn_file_actions_t fa;
-  posix_spawn_file_actions_init(&fa);
-  posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
-  posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
-  posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
-  pid_t pid;
-  int rc = posix_spawnp(&pid, "git", &fa, nullptr, argv.data(), environ);
-  posix_spawn_file_actions_destroy(&fa);
-  int status = 0;
-  if (rc != 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) return -1;
-  return WEXITSTATUS(status);
-}
-
 // What a git command in `dir` prints, up to `cap` bytes (the rest is read and dropped). Empty if it
 // fails or takes longer than kGitSeconds, when it's stopped.
 std::string git_text(const std::string& dir, const std::vector<std::string>& args, size_t cap) {
@@ -832,22 +811,13 @@ std::string git_text(const std::string& dir, const std::vector<std::string>& arg
   return out;
 }
 
-// In git and unchanged since the last commit: git history already holds this version.
-bool committed_clean(const std::string& path) {
-  size_t cut = path.rfind('/');
-  std::string dir = path.substr(0, cut), name = path.substr(cut + 1);
-  return git(dir, {"ls-files", "--error-unmatch", "--", name}) == 0 &&
-         git(dir, {"diff", "--quiet", "HEAD", "--", name}) == 0;
-}
-
 std::string archive_dir(const std::string& cwd) { return cfg.root + "/archive/" + slug(cwd); }
 
-// Keep a copy of an agent's handoff, named by time, session and agent. Returns where it went, "git"
-// when git history already has it, or "" when there was nothing to keep.
+// Keep a copy of an agent's handoff, named by time, session and agent. Returns where it went, or ""
+// when there was nothing to keep.
 std::string archive(const std::string& d, const std::string& agent, const std::string& cwd, const std::string& tag) {
   std::string slot = slot_path(d, agent), file = handoff_file(d, agent), text;
   if (!read_file(file, text, -1, kReadCap) || trim(text).empty()) return "";
-  if (file != slot && committed_clean(file)) return "git";
   std::string dir = archive_dir(cwd);
   mkdirs(dir);
   std::string base = dir + "/" + stamp("%Y-%m-%d_%H%M%S") + "_" + d.substr(d.rfind('/') + 1, 8) + "_" + agent +
@@ -879,139 +849,25 @@ std::vector<Event> events(const std::string& d) {
   return evs;
 }
 
-// A subagent's type, whether it can write a handoff, and the auto-compact window its definition sets
-// (0 for none), as on_subagent_start recorded them in types/<agent>: "<type>\t<rw|ro>\t<window>".
+// A subagent's type, as on_subagent_start recorded it in types/<agent>, and whether it can be asked for
+// a handoff.
 struct AgentInfo {
   std::string type;
   bool readonly = false;
-  double window = 0;
 };
+
+bool read_only(const std::string& type) {
+  for (const char* t : kReadOnlyTypes)
+    if (type == t) return true;
+  return false;
+}
 
 AgentInfo agent_info(const std::string& d, const std::string& agent) {
   AgentInfo info;
   std::string text;
   if (agent == "main" || !read_file(d + "/types/" + agent, text)) return info;
-  size_t a = text.find('\t'), b = a == std::string::npos ? a : text.find('\t', a + 1);
-  info.type = trim(text.substr(0, a));
-  info.readonly = a != std::string::npos && trim(text.substr(a + 1, b == std::string::npos ? b : b - a - 1)) == "ro";
-  info.window = b == std::string::npos ? 0 : atof(text.c_str() + b + 1);
-  return info;
-}
-
-bool skip_digits(const std::string& s, size_t& k) {
-  size_t from = k;
-  while (k < s.size() && isdigit(static_cast<unsigned char>(s[k]))) ++k;
-  return k > from;
-}
-
-// A number the way 2.1.302 reads the env var and agent files: an integer, scientific notation ("1e6"),
-// or digits grouped by one separator ("333,000"); anything else is read up to its first non-digit, so
-// "333k" is 333 (only /autocompact understands k and m). -1 when it isn't a positive integer.
-double claude_number(const std::string& raw) {
-  std::string s = trim(raw);
-  if (s.empty() || s[0] == '-') return -1;
-  size_t start = s[0] == '+', k = start;
-  if (s.size() <= 32) {
-    bool whole = skip_digits(s, k), frac = false;
-    if (k < s.size() && s[k] == '.') frac = skip_digits(s, ++k);
-    if ((whole || frac) && k < s.size() && (s[k] == 'e' || s[k] == 'E')) {
-      if (++k < s.size() && (s[k] == '+' || s[k] == '-')) ++k;
-      if (skip_digits(s, k) && k == s.size()) {
-        double v = strtod(s.c_str() + start, nullptr);
-        return v > 0 && v == std::floor(v) ? v : -1;
-      }
-    }
-    k = start;
-    skip_digits(s, k);
-    if (k - start >= 1 && k - start <= 3 && k < s.size() && strchr("_, ", s[k])) {
-      char sep = s[k];
-      std::string plain = s.substr(start, k - start);
-      bool grouped = true;
-      while (grouped && k < s.size()) {
-        size_t group = k + 1;
-        k = group;
-        grouped = s[group - 1] == sep && skip_digits(s, k) && k - group == 3;
-        plain += s.substr(group, 3);
-      }
-      if (grouped) return atof(plain.c_str()) > 0 ? atof(plain.c_str()) : -1;
-    }
-  }
-  k = start;
-  if (!skip_digits(s, k)) return -1;
-  double v = atof(s.substr(start, k - start).c_str());
-  return v > 0 ? v : -1;
-}
-
-// A top-level frontmatter value: the rest of its line, or the "- item" lines under it, as one string.
-std::string front_value(const std::string& front, const std::string& key) {
-  std::vector<std::string> lines;
-  for (size_t at = 0;;) {
-    size_t eol = front.find('\n', at);
-    lines.push_back(front.substr(at, eol == std::string::npos ? eol : eol - at));
-    if (eol == std::string::npos) break;
-    at = eol + 1;
-  }
-  for (size_t k = 0; k < lines.size(); ++k) {
-    if (lines[k].compare(0, key.size() + 1, key + ":") != 0) continue;
-    std::string value = trim(lines[k].substr(key.size() + 1));
-    for (size_t j = k + 1; j < lines.size(); ++j) {
-      std::string item = trim(lines[j]);
-      if (item.empty()) continue;
-      if (!strchr(" \t-", lines[j][0])) break;  // the next key
-      if (item[0] == '-') value += (value.empty() ? "" : ", ") + trim(item.substr(1));
-      else value += " " + item;  // a value continued on the next line, such as a [...] list
-    }
-    return value;
-  }
-  return "";
-}
-
-// Whether a tool list (comma or space separated, brackets and quotes allowed) names any of `tools`.
-bool lists(const std::string& list, std::initializer_list<const char*> tools) {
-  std::string word;
-  for (size_t k = 0; k <= list.size(); ++k) {
-    char c = k < list.size() ? list[k] : ',';
-    if (isalnum(static_cast<unsigned char>(c)) || c == '*' || c == '_') {
-      word += c;
-      continue;
-    }
-    if (c == '(') {  // Write(src/**) still writes
-      size_t close = list.find(')', k);
-      k = close == std::string::npos ? list.size() : close;
-    }
-    for (const char* t : tools)
-      if (word == t) return true;
-    word.clear();
-  }
-  return false;
-}
-
-// What a subagent's definition says: read-only when its tools leave out both Write and Edit (memory
-// adds them back), and the auto-compact window it may set for itself.
-AgentInfo definition(const std::string& cwd, const std::string& type) {
-  AgentInfo info;
-  info.type = type;
-  for (const char* t : kReadOnlyTypes)
-    if (type == t) info.readonly = true;
-  if (info.readonly || type.empty() || type.find('/') != std::string::npos || type.find("..") != std::string::npos)
-    return info;
-  for (const std::string& dir : {cwd + "/.claude/agents", cfg.config_dir + "/agents"}) {
-    std::string text;
-    if (!read_file(dir + "/" + type + ".md", text, -1, 16384)) continue;
-    text = replace_all(text, "\r\n", "\n");
-    if (text.compare(0, 4, "---\n") != 0) return info;
-    size_t end = text.find("\n---", 3);
-    std::string front = end == std::string::npos ? text.substr(4) : end < 4 ? "" : text.substr(4, end - 4);
-    std::string tools = front_value(front, "tools"), denied = front_value(front, "disallowedTools");
-    bool writes = tools.empty() || lists(tools, {"Write", "Edit", "*"});
-    if (lists(denied, {"Write"}) && lists(denied, {"Edit"})) writes = false;
-    info.readonly = !writes && front_value(front, "memory").empty();
-    std::string raw = front_value(front, "autoCompactWindow");
-    if (raw.size() >= 2 && (raw[0] == '"' || raw[0] == '\'') && raw.back() == raw[0]) raw = raw.substr(1, raw.size() - 2);
-    double w = claude_number(raw);
-    if (w >= 1e5 && w <= 1e6) info.window = w;  // Claude Code ignores values outside this range
-    return info;
-  }
+  info.type = trim(text);
+  info.readonly = read_only(info.type);
   return info;
 }
 
@@ -1123,18 +979,9 @@ double window(const std::string& model) {
   return kDefaultWindow;
 }
 
-// The auto-compact window set by CLAUDE_CODE_AUTO_COMPACT_WINDOW, held to 100k–1M as Claude Code
-// holds it. 0 when it isn't set or isn't a number, which Claude Code ignores too.
-double env_window() {
-  const char* e = getenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW");
-  double v = e && *e ? claude_number(e) : -1;
-  return v > 0 ? std::min(std::max(v, 1e5), 1e6) : 0;
-}
-
-// The auto-compact window set for a model, read the way Claude Code reads it: the env override, else
-// the model's own modelSettings entry, else the top-level setting. "auto", or nothing set, is 0.
+// The auto-compact window set for a model in the user's settings: its modelSettings entry, which the
+// installer writes, else the top-level setting. "auto", or nothing set, is 0.
 double configured_window(const std::string& model) {
-  if (double e = env_window()) return e;
   static bool loaded = false;
   static Json settings;
   if (!loaded) {
@@ -1143,27 +990,15 @@ double configured_window(const std::string& model) {
     if (read_file(cfg.settings, text)) Parser(text).parse(settings);
   }
   const Json* ms = settings.get("modelSettings");
-  std::string name = canonical(model);
-  const Json* entry = nullptr;
-  if (ms)
-    for (const auto& f : ms->fields)
-      if (f.second.has("autoCompactWindow") && canonical(f.first) == name && (!entry || f.first == name))
-        entry = &f.second;
-  if (entry) return entry->num("autoCompactWindow");  // "auto" is 0: the model's own window
+  const Json* entry = ms ? ms->get(canonical(model)) : nullptr;
+  if (entry && entry->has("autoCompactWindow")) return entry->num("autoCompactWindow");
   return settings.num("autoCompactWindow");
 }
 
-// Roughly where auto-compact fires for a model, given the window an agent's definition may set.
-double trigger_point(const std::string& model, double agent_window = 0) {
+// Roughly where auto-compact fires for a model.
+double trigger_point(const std::string& model) {
   double w = window(model), c = configured_window(model);
-  if (c > 0) w = std::min(w, c);
-  if (agent_window > 0 && env_window() == 0) w = std::min(w, agent_window);  // the env override wins
-  double t = w - kTriggerGap;
-  if (const char* p = getenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")) {
-    double pct = atof(p);
-    if (pct > 0 && pct <= 100) t = std::min(t, std::floor((w - 20000) * pct / 100));
-  }
-  return t;
+  return (c > 0 ? std::min(w, c) : w) - kTriggerGap;
 }
 
 bool planning(const std::string& d);
@@ -1191,7 +1026,7 @@ Candidate compacting(const std::string& d, const std::string& transcript, const 
     c.agent = agent;
     c.u = usage(transcript_of(d, transcript, agent), agent == "main");
     c.info = agent_info(d, agent);
-    double trigger = c.trigger = trigger_point(c.u.model, c.info.window);
+    double trigger = c.trigger = trigger_point(c.u.model);
     if (c.u.tokens <= 0 || c.u.tokens < trigger - kTriggerSlack) return false;
     c.limit = std::min(cfg.ceiling, kWindowShare * window(c.u.model));
     c.at_limit = c.u.tokens >= c.limit;
@@ -1254,7 +1089,7 @@ bool needs_trim(const std::string& d, const std::string& agent, const Json& a) {
 // Where the full version of a handoff being trimmed is kept.
 std::string kept(const Json& a) {
   std::string copy = a.str("trim_copy");
-  return copy == "git" ? "git history has it" : copy.empty() ? "no copy was made" : "a copy is at " + copy;
+  return copy.empty() ? "no copy was made" : "a copy is at " + copy;
 }
 
 std::string trim_request(const std::string& d, const std::string& agent, const Json& a, bool reminder) {
@@ -1357,7 +1192,6 @@ std::string save_facts(const std::string& d, const std::string& agent, const std
 // ---- Handlers.
 
 void prune();
-std::string pickup(const std::string& cwd, const std::string& d_new);
 
 // Archive the handoff unless this version already was (a release that went elsewhere, then another).
 void archive_once(const std::string& d, const std::string& agent, Json& a, const std::string& cwd) {
@@ -1471,30 +1305,17 @@ void on_session_start(const Json& in, const std::string& d) {
     save_state(d, st);
   }
   if (src == "startup") prune();
-  std::string text = replace_all(kAskedMain, "{path}", slot_path(d, "main"));
-  if (src == "clear") {
-    std::string old = pickup(in.str("cwd"), d);
-    if (!old.empty()) text = old + "\n\n" + text;
-  }
-  context("SessionStart", text);
-}
-
-// /clear ends the old session first: note which one, so the new session loads only its handoff.
-void on_session_end(const Json& in, const std::string& d) {
-  if (in.str("reason") != "clear") return;
-  mkdirs(cfg.root + "/.cleared");
-  write_atomic(cfg.root + "/.cleared/" + slug(in.str("cwd")), d.substr(d.rfind('/') + 1));
+  context("SessionStart", replace_all(kAskedMain, "{path}", slot_path(d, "main")));
 }
 
 void on_subagent_start(const Json& in, const std::string& d, const std::string& agent) {
   std::string type = in.str("agent_type");
   if (type.empty()) return;  // Claude Code's own helpers, such as the compaction summarizer
   note_event(d, agent);      // a resumed subagent can compact before its first tool call
-  AgentInfo info = definition(session_cwd(d, in), type);
   mkdirs(d + "/types");
-  write_atomic(d + "/types/" + agent, type + "\t" + (info.readonly ? "ro" : "rw") + "\t" + std::to_string(long(info.window)));
-  log(d, "subagent " + agent + " (" + type + (info.readonly ? ", read-only" : "") + ") started");
-  if (!info.readonly) context("SubagentStart", replace_all(kAskedSubagent, "{path}", slot_path(d, agent)));
+  write_atomic(d + "/types/" + agent, type);
+  log(d, "subagent " + agent + " (" + type + (read_only(type) ? ", read-only" : "") + ") started");
+  if (!read_only(type)) context("SubagentStart", replace_all(kAskedSubagent, "{path}", slot_path(d, agent)));
 }
 
 void on_subagent_stop(const Json& in, const std::string& d, const std::string& agent) {
@@ -1756,34 +1577,6 @@ void on_pre_compact(const Json& in, const std::string& d) {
   block("auto-handoff: waiting for a handoff before compacting");
 }
 
-// After /clear: the handoff of the session that was just cleared, if it wrote one it hasn't loaded.
-std::string pickup(const std::string& cwd, const std::string& d_new) {
-  std::string link = cfg.root + "/.cleared/" + slug(cwd), old;
-  if (!read_file(link, old) || now() - mtime(link) > kClearLinkSeconds) return "";
-  unlink(link.c_str());
-  old = trim(old);
-  if (!safe_id(old)) return "";
-  std::string d = cfg.root + "/" + old;
-  if (d == d_new) return "";
-  Json st = load_state(d);
-  const Json* a = st.get("agents")->get("main");
-  double since = a ? (a->has("pending") ? a->num("pending") : a->num("compacted")) : 0;
-  if (!slot_ready(d, "main", since)) return "";
-  std::string p = handoff_file(d, "main"), text = read_handoff(p);
-  {
-    Lock lock(d);
-    Json cur = load_state(d);
-    Json& m = cur.get("agents")->at("main");
-    archive_once(d, "main", m, cwd);
-    settle(m);
-    save_state(d, cur);
-  }
-  std::string head = std::string(kUserNote) + "\n\n[auto-handoff] ";
-  if (text.size() > kInjectCap - 400)
-    return head + "Before doing anything else, read the handoff from the session you just cleared: " + p;
-  return head + "Handoff from the session you just cleared (" + p + "):\n\n" + text;
-}
-
 void prune() {
   double cutoff = now() - kKeepDays * 86400;
   for (const auto& name : list_dir(cfg.root)) {
@@ -1801,7 +1594,6 @@ void run(const Json& in) {
   if (!safe_id(sid) || !safe_id(agent)) return;
   std::string d = cfg.root + "/" + sid;
   if (ev == "SessionStart") on_session_start(in, d);
-  else if (ev == "SessionEnd") on_session_end(in, d);
   else if (ev == "SubagentStart") on_subagent_start(in, d, agent);
   else if (ev == "SubagentStop") on_subagent_stop(in, d, agent);
   else if (ev == "PostToolUse" || ev == "UserPromptSubmit") on_activity(in, d, agent, ev, true);

@@ -2,7 +2,7 @@
 the hook holds compaction, gets a handoff written, and loads it afterwards.
 
 Run: make live, or python3 tests/live.py [scenario ...]
-(scenarios: main stop parallel modelsettings project cycles)
+(scenarios: main stop parallel project cycles)
 Costs roughly $0.50-1.50 per scenario on Sonnet. Re-run after Claude Code upgrades: the behaviour
 these hooks rely on is mostly undocumented.
 """
@@ -19,22 +19,24 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HOOK = os.path.abspath(os.path.join(HERE, "..", "build", "auto-handoff"))
 # Each run gets a fresh folder here, next to the real one; nothing is deleted.
 HANDOFFS = os.path.expanduser("~/.local/state/claude-handoffs-livetest")
-EVENTS = ["SessionStart", "SessionEnd", "SubagentStart", "SubagentStop", "UserPromptSubmit", "PostToolUse",
-          "PostToolUseFailure", "PermissionDenied", "Stop", "PreCompact"]
+EVENTS = ["SessionStart", "SubagentStart", "SubagentStop", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure",
+          "PermissionDenied", "Stop", "PreCompact"]
 FOLLOW = "Follow any [auto-handoff] instructions you receive."
 
+# Every scenario compacts at about 67k tokens: a 100k window (the smallest Claude Code accepts) set for
+# the model in settings, as the installer sets it. Each file is about 12.9k tokens.
 SCENARIOS = {
     # Compaction is held mid-turn, the agent is reminded, writes its handoff, and continues from it.
-    "main": dict(env={"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000"}, turns=[
+    "main": dict(turns=[
         "Read f01.txt through f08.txt with the Read tool, in order, strictly one file per message. " + FOLLOW +
         " When done, reply with the Owner line of the handoff you continued from, if any."]),
     # Compaction first waits on the final reply, so the Stop hook has to ask for the handoff.
-    # (50% of 100k: crossed after the third file, before the reply, but not after the second.)
-    "stop": dict(env={"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"}, turns=[
-        "Read f01.txt, f02.txt and f03.txt with the Read tool, strictly one file per message, then reply with "
-        "just: done. " + FOLLOW]),
+    # (Crossed after the fifth file, before the reply, but not after the fourth.)
+    "stop": dict(turns=[
+        "Read f01.txt, f02.txt, f03.txt, f04.txt and f05.txt with the Read tool, strictly one file per message, "
+        "then reply with just: done. " + FOLLOW]),
     # Two subagents compact at about the same time and each continues from its own handoff.
-    "parallel": dict(env={"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000"}, turns=[
+    "parallel": dict(turns=[
         "In ONE message, make TWO Agent tool calls at the same time (parallel, foreground, general-purpose), "
         "then relay both final reports verbatim. Agent 1 task text: 'Read f01.txt, f02.txt, f03.txt, f04.txt, "
         "f05.txt, f06.txt, f07.txt with the Read tool, strictly one file per message. " + FOLLOW +
@@ -42,20 +44,15 @@ SCENARIOS = {
         "f12.txt, f11.txt, f10.txt, f09.txt, f08.txt, f07.txt, f06.txt with the Read tool, strictly one file per "
         "message. " + FOLLOW + " Finally report the Owner line of the handoff you continued from, if any.'"]),
     # The session already keeps docs/HANDOFF.md: it's updated in place and the slot points at it.
-    "project": dict(env={"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000"}, project_handoff=True, turns=[
+    "project": dict(project_handoff=True, turns=[
         "This project keeps its session handoff in docs/HANDOFF.md; whenever a handoff is needed, update that "
         "file and make sure it contains the line 'Marker: PLUM-42'. Now read f01.txt through f07.txt with the "
         "Read tool, in order, strictly one file per message. " + FOLLOW + " When done, reply with the Marker "
         "line of the handoff you continued from, if any."]),
     # Two compactions in one session: the second handoff is a rewrite, not the first one plus more.
-    "cycles": dict(env={"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000"}, turns=[
+    "cycles": dict(turns=[
         "Read f01.txt through f11.txt with the Read tool, in order, strictly one file per message. " + FOLLOW +
         " When done, reply with just: done."]),
-    # Does a subagent use the per-model autoCompactWindow from settings (no env override)?
-    "modelsettings": dict(env={}, model_window=100000, turns=[
-        "Use the Agent tool once (general-purpose, foreground) with this task text, then relay its final report: "
-        "'Read f01.txt through f07.txt with the Read tool, in order, strictly one file per message. " + FOLLOW +
-        " Finally report the Owner line of the handoff you continued from, if any.'"]),
 }
 
 
@@ -81,13 +78,12 @@ def run(name, spec, tmp, run_dir):
     settings = {
         "hooks": {e: [{"hooks": [{"type": "command", "command": HOOK, "timeout": 10}]}] for e in EVENTS},
         "permissions": {"allow": ["%s(~/.local/state/claude-handoffs-livetest/**)" % t for t in ("Read", "Edit", "Write")]},
+        "modelSettings": {"claude-sonnet-5-5": {"autoCompactWindow": 100000}},
     }
-    if spec.get("model_window"):
-        settings["modelSettings"] = {"claude-sonnet-5-5": {"autoCompactWindow": spec["model_window"]}}
     with open(os.path.join(tmp, name + ".settings.json"), "w") as f:
         json.dump(settings, f)
     env = dict(os.environ, AUTO_HANDOFF_DIR=handoffs, AUTO_HANDOFF_LOG=log, AUTO_HANDOFF_CEILING="150000",
-               AUTO_HANDOFF_SETTINGS=os.path.join(tmp, name + ".settings.json"), **spec["env"])
+               AUTO_HANDOFF_SETTINGS=os.path.join(tmp, name + ".settings.json"))
     cmd = ["claude", "-p", "--model", "sonnet", "--strict-mcp-config", "--setting-sources", "project",
            "--settings", os.path.join(tmp, name + ".settings.json"), "--input-format", "stream-json",
            "--output-format", "stream-json", "--verbose", "--allowedTools", "Read", "Agent", "Task"]
@@ -180,7 +176,7 @@ def check(name, out):
         expect("compaction of main allowed: handoff" in log, "released by the slot")
         injected = [l for l in out["main_transcript"].splitlines() if '"hook_additional_context"' in l and "just compacted" in l]
         expect(injected and "PLUM-42" in injected[-1], "project handoff loaded after compaction")
-        expect(len(out["archive"]) == 1, "archived, since it's not in git (%d)" % len(out["archive"]))
+        expect(len(out["archive"]) == 1, "archived (%d)" % len(out["archive"]))
         sizes = summary_lengths(out["main_transcript"])
         expect(sizes and max(sizes) < 2000, "short summary (%s chars)" % sizes)
     if name == "cycles":
@@ -195,15 +191,14 @@ def check(name, out):
             print("  handoff sizes: %s" % [len(w) for w in writes])
     if name == "stop":
         expect("Stop held for main's handoff" in log, "Stop hook asked for the handoff")
-    if name in ("parallel", "modelsettings"):
+    if name == "parallel":
         subs = {}
         for t in out["sub_transcripts"]:
             agent = os.path.basename(t)[len("agent-"):-len(".jsonl")]
             written = writes_to(open(t).read(), agent + ".md")
             if written:
                 subs[agent] = written[-1]
-        want = 2 if name == "parallel" else 1
-        expect(len(subs) == want, "%d subagent handoff(s) written: %s" % (want, sorted(subs)))
+        expect(len(subs) == 2, "2 subagent handoffs written: %s" % sorted(subs))
         for agent, handoff in subs.items():
             expect("compaction of %s allowed: handoff" % agent in log, "%s released by its handoff" % agent[:8])
             t = [x for x in out["sub_transcripts"] if x.endswith("agent-%s.jsonl" % agent)]

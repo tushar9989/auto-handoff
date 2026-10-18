@@ -20,6 +20,8 @@ class HookTest(unittest.TestCase):
         self.proj = os.path.join(self.tmp.name, "proj")
         os.makedirs(os.path.join(self.proj, SID, "subagents"))
         os.makedirs(self.config)
+        with open(os.path.join(self.config, "settings.json"), "w") as f:
+            json.dump({"autoCompactWindow": 333000}, f)
         self.transcript = os.path.join(self.proj, SID + ".jsonl")
         self.d = os.path.join(self.root, SID)
         self.tokens("main", 300_000)
@@ -30,9 +32,8 @@ class HookTest(unittest.TestCase):
     # ---- helpers
 
     def env(self):
-        # As installed: a 333k window, so compaction first tries at about 300k.
-        return dict(os.environ, AUTO_HANDOFF_DIR=self.root, CLAUDE_CONFIG_DIR=self.config,
-                    CLAUDE_CODE_AUTO_COMPACT_WINDOW="333000")
+        # settings.json sets a 333k window, as installed, so compaction first tries at about 300k.
+        return dict(os.environ, AUTO_HANDOFF_DIR=self.root, CLAUDE_CONFIG_DIR=self.config)
 
     def transcript_path(self, agent):
         if agent == "main":
@@ -524,48 +525,22 @@ class HookTest(unittest.TestCase):
         self.assertFalse(self.blocked(self.compact()))
         self.assertNotIn("just compacted", self.returned())
 
-    def test_agent_definition_sets_its_own_window(self):
-        os.makedirs(os.path.join(self.config, "agents"))
-        with open(os.path.join(self.config, "agents", "scout.md"), "w") as f:
-            f.write("---\nname: scout\nautoCompactWindow: '200000'\n---\n")  # YAML quotes are fine
-        self.tokens("main", 50_000)
-        self.tokens("s", 160_000)  # near its own 167k trigger, far below the session's 300k
-        self.run_hook("SubagentStart", "s", agent_type="scout")
-        env = dict(self.env())
-        del env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]  # the env override would win over the definition
-        with open(os.path.join(self.config, "settings.json"), "w") as f:
-            json.dump({"autoCompactWindow": 333000}, f)
-        self.env = lambda: env
-        self.hold("s")
-        self.assertIn("pending", self.agents()["s"])
-
-    def test_window_settings_read_like_claude_code(self):
-        def held(tokens, model, settings, window=None):
+    def test_window_settings(self):
+        def held(tokens, model, settings):
             self.tearDown()
             self.setUp()
             self.tokens("main", tokens, model=model)
             with open(os.path.join(self.config, "settings.json"), "w") as f:
                 json.dump(settings, f)
-            env = dict(os.environ, AUTO_HANDOFF_DIR=self.root, CLAUDE_CONFIG_DIR=self.config)
-            if window:
-                env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = window
-            self.env = lambda: env
             self.tool()
             return self.blocked(self.compact())
         ms = lambda key, w: {"modelSettings": {key: {"autoCompactWindow": w}}}
-        self.assertTrue(held(300_000, "claude-opus-5-5", {}, window="333000"))
-        self.assertFalse(held(240_000, "claude-opus-5-5", {}, window="333,000"))  # grouped digits count
-        self.assertTrue(held(300_000, "claude-opus-5-5", {}, window="333,000"))
-        self.assertTrue(held(20_000, "claude-opus-5-5", {}, window="333k"))  # Claude Code reads 333: a 100k window
-        self.assertFalse(held(10_000, "claude-opus-5-5", {}, window="50000"))  # raised to 100k, as Claude Code does
-        self.assertFalse(held(300_000, "claude-opus-5-5", {}, window="lots"))  # ignored: the 1M window
+        self.assertTrue(held(300_000, "claude-opus-5-5", ms("claude-opus-5-5", 333000)))
+        self.assertFalse(held(240_000, "claude-opus-5-5", ms("claude-opus-5-5", 333000)))  # not near it yet
         self.assertTrue(held(300_000, "claude-opus-5-5-20260815", ms("claude-opus-5-5", 333000)))
         self.assertTrue(held(300_000, "us.anthropic.claude-opus-5-5-v1:0", ms("claude-opus-5-5", 333000)))
         self.assertFalse(held(300_000, "claude-opus-5-5", ms("claude-opus-5", 333000)))  # another model's key
-        self.assertTrue(held(300_000, "claude-opus-5-5", ms("claude-opus-5-5[1m]", 333000)))  # keys are normalised too
-        both = {"modelSettings": {"claude-opus-5-5[1m]": {"autoCompactWindow": 1000000},
-                                  "claude-opus-5-5": {"autoCompactWindow": 333000}}}
-        self.assertTrue(held(300_000, "claude-opus-5-5", both))  # the canonical key wins
+        self.assertFalse(held(300_000, "claude-opus-5-5", {}))  # nothing set: the model's own 1M window
         auto = {"autoCompactWindow": 333000, "modelSettings": {"claude-opus-5-5": {"autoCompactWindow": "auto"}}}
         self.assertFalse(held(300_000, "claude-opus-5-5", auto))  # "auto": the model's own 1M window
 
@@ -577,56 +552,24 @@ class HookTest(unittest.TestCase):
 
     # ---- read-only agents and hold budgets
 
-    def test_agent_definitions_are_read_carefully(self):
-        cases = {
-            "---\nname: a\ntools:\n  - Read\n  - Write\n---\nbody\n": "rw",
-            "---\nname: a\ntools: [Read, Write]\n---\n": "rw",
-            "---\nname: a\ntools: Read, Grep\n---\n": "ro",
-            "---\r\nname: a\r\ntools: Read, Grep\r\n---\r\n": "ro",
-            "---\nname: a\ndisallowedTools: Write, Edit, MultiEdit\n---\n": "ro",
-            "---\nname: a\ntools: Read\nmemory: project\n---\n": "rw",
-            "---\nname: a\ndescription: |\n  tools: Write and Edit\ntools: Read\n---\n": "ro",
-            "---\nname: a\n---\ntools: Read\n": "rw",
-            "---\nname: a\ntools: Read, Write(docs/**)\n---\n": "rw",
-            "---\nname: a\ntools: [Read, Grep,\n  Write]\n---\n": "rw",
-            "---\nname: a\ndisallowedTools: Write, Edit\n---\n": "ro",
-            "---\nname: a\ntools: Read, MultiEdit\n---\n": "ro",
-        }
-        os.makedirs(os.path.join(self.config, "agents"))
-        for n, (text, want) in enumerate(cases.items()):
-            with open(os.path.join(self.config, "agents", "t%d.md" % n), "w") as f:
-                f.write(text)
-            self.run_hook("SubagentStart", "s%d" % n, agent_type="t%d" % n)
-            with open(os.path.join(self.d, "types", "s%d" % n)) as f:
-                self.assertEqual(f.read().split("\t")[1], want, text)
+    def test_explore_is_read_only(self):
+        self.tokens("main", 50_000)
+        self.tokens("exp", 300_000)
+        self.assertIsNone(self.run_hook("SubagentStart", "exp", agent_type="Explore"))  # no handoff path
+        self.tool("exp")
+        self.assertFalse(self.blocked(self.compact()))
+        self.assertNotIn("just compacted", self.returned())
+        self.assertEqual(self.ctx(self.tool("exp")), "")
 
-    def test_read_only_agent_is_never_held(self):
+    def test_custom_agent_is_held_whatever_its_tools(self):
+        # A reviewer without Write or Edit still writes files with Bash, so it can write a handoff.
         os.makedirs(os.path.join(self.config, "agents"))
         with open(os.path.join(self.config, "agents", "art-reviewer.md"), "w") as f:
             f.write("---\nname: art-reviewer\ntools: Read, Grep, Glob, Bash, SendMessage\n---\nReview art.\n")
         self.tokens("main", 50_000)
         self.tokens("rev", 300_000)
-        self.assertIsNone(self.run_hook("SubagentStart", "rev", agent_type="art-reviewer"))  # no handoff path
-        self.tool("rev")
-        self.assertFalse(self.blocked(self.compact()))
-        self.assertNotIn("just compacted", self.returned())
-        self.assertEqual(self.ctx(self.tool("rev")), "")
-
-    def test_explore_is_read_only(self):
-        self.tokens("main", 50_000)
-        self.tokens("exp", 300_000)
-        self.run_hook("SubagentStart", "exp", agent_type="Explore")
-        self.tool("exp")
-        self.assertFalse(self.blocked(self.compact()))
-
-    def test_agent_with_write_is_held(self):
-        os.makedirs(os.path.join(self.config, "agents"))
-        with open(os.path.join(self.config, "agents", "builder.md"), "w") as f:
-            f.write("---\nname: builder\ntools: Read, Write, Bash\n---\n")
-        self.tokens("main", 50_000)
-        self.tokens("b", 300_000)
-        self.run_hook("SubagentStart", "b", agent_type="builder")
-        self.hold("b")
+        self.assertIn("rev.md", self.ctx(self.run_hook("SubagentStart", "rev", agent_type="art-reviewer")))
+        self.hold("rev")
 
     def test_subagent_hold_budget(self):
         self.tokens("main", 50_000)
@@ -733,28 +676,18 @@ class HookTest(unittest.TestCase):
         injected = self.returned()
         self.assertIn("RESUME HERE: beard A", injected)
         self.assertIn(handoff + " (via " + os.path.join(self.d, "main.md") + ")", injected)  # names the slot
-        self.assertEqual(len(self.archived()), 1)  # not in git, so archived
+        self.assertEqual(len(self.archived()), 1)
         self.tool()
         self.tokens("main", 300_000)
         self.hold()
         self.assertIn("This session's handoff file is " + handoff, self.ctx(self.tool()))
 
-    def test_committed_unchanged_handoff_is_left_to_git(self):
-        handoff = self.project_handoff("# Game handoff\nin git", git=True)
+    def test_committed_handoff_is_archived_too(self):
+        self.project_handoff("# Game handoff\nin git", git=True)
         self.hold()
-        self.write_handoff("main", handoff)
+        self.write_handoff("main", os.path.join(self.tmp.name, "game", "docs", "HANDOFF.md"))
         self.tool()
         self.assertTrue(self.shortens_summary(self.compact()))
-        self.assertEqual(self.archived(), [])
-
-    def test_uncommitted_changes_are_archived(self):
-        handoff = self.project_handoff("# Game handoff\nin git", git=True)
-        with open(handoff, "a") as f:
-            f.write("\nnot committed yet")
-        self.hold()
-        self.write_handoff("main", handoff)
-        self.tool()
-        self.compact()
         self.assertEqual(len(self.archived()), 1)
 
     def test_long_project_handoff_is_copied_then_trimmed_in_place(self):
@@ -899,31 +832,6 @@ class HookTest(unittest.TestCase):
         self.assertIn("The latest messages this agent was given", text)
         self.assertIn("Read f01.txt to f07.txt", text)
         self.assertIn("also f08.txt", text)
-
-    # ---- /clear
-
-    def test_clear_loads_the_cleared_sessions_handoff(self):
-        self.run_hook("SessionStart", source="startup")
-        self.write_handoff("main", "Owner: main session - before clear")
-        self.run_hook("SessionEnd", reason="clear")
-        new_sid = "99999999-2222-3333-4444-555555555555"
-        out = self.ctx(self.run_hook("SessionStart", sid=new_sid, source="clear"))
-        self.assertTrue(out.startswith(NOTE))
-        self.assertIn("before clear", out)
-        out = self.ctx(self.run_hook("SessionStart", sid=new_sid, source="clear"))
-        self.assertNotIn("before clear", out)  # only once
-
-    def test_clear_ignores_other_sessions_in_the_folder(self):
-        self.run_hook("SessionStart", source="startup")
-        self.write_handoff("main", "Owner: main session - session A's")
-        other = "22222222-2222-3333-4444-555555555555"
-        self.run_hook("SessionStart", sid=other, source="startup")
-        self.run_hook("SessionEnd", sid=other, reason="clear")
-        new_sid = "99999999-2222-3333-4444-555555555555"
-        self.assertNotIn("session A's", self.ctx(self.run_hook("SessionStart", sid=new_sid, source="clear")))
-        self.assertNotIn("session A's", self.ctx(self.run_hook("SessionStart", sid=new_sid, source="clear")))
-        self.tool()
-        self.assertTrue(self.shortens_summary(self.compact("manual")))  # A still has its handoff
 
     # ---- input handling
 

@@ -45,7 +45,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(installed["modelSettings"]["claude-opus-4-8"]["autoCompactWindow"], 333000)
         self.assertIs(installed["idleCompaction"], False)
         self.assertIs(installed["precomputeCompactionEnabled"], False)
-        self.assertEqual(len(installed["hooks"]["SessionEnd"]), 1)
+        self.assertEqual(len(installed["hooks"]["PreCompact"]), 1)
         self.run_install()  # idempotent
         self.assertEqual(self.read(), installed)
         self.run_install("--uninstall")

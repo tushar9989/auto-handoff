@@ -52,8 +52,8 @@ Claude Code's compaction hooks don't say which agent is compacting, so the hook 
   never chosen. If the latest response isn't in the transcript's last 4MB (say, after many large
   images), the hook reads back further.
 - Sometimes the likeliest agent can't be held, while another candidate is within 10k of its own
-  compaction point. Agents that can't be held are read-only agents, the main session in plan mode,
-  agents with a small window, and agents already released. In that case the attempt is held once,
+  compaction point. Agents that can't be held are Explore and Plan agents, the main session in plan
+  mode, agents with a small window, and agents already released. In that case the attempt is held once,
   without recording anything:
   - if the other agent is the one compacting, its retry comes right after its own tool call, which
     makes it the clear pick;
@@ -63,20 +63,11 @@ Claude Code's compaction hooks don't say which agent is compacting, so the hook 
 - An attempt is never blocked when any candidate is past its safety limit, or is a small-window
   agent within 20k of its compaction point. Blocking either one could make a request fail.
 
-The compaction point is read the way Claude Code reads it:
-- `CLAUDE_CODE_AUTO_COMPACT_WINDOW` comes first, read like Claude Code 2.1.302 reads it:
-  - plain digits work, and so do `333,000` and `1e6`;
-  - `333k` is read as 333;
-  - the value is held to 100k–1M, so `333k` means a 100k window.
-
-  (Only the `/autocompact` command understands `k` and `m`.)
-- Next is the model's own `modelSettings` entry in `~/.claude/settings.json`. It matches by
-  canonical name, so dated, `[1m]`, Bedrock and Vertex spellings count; `"auto"` means the model's
-  own window.
-- Otherwise the top-level `autoCompactWindow` applies.
-- A subagent definition's own `autoCompactWindow` caps all of these, unless the env var is set. It
-  has to be a number from 100000 to 1000000; `200k` is ignored, as Claude Code ignores it.
-- `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is applied last.
+The compaction point is 33k below the window set for the model in `~/.claude/settings.json`: its
+`modelSettings` entry (the one the installer writes; dated, Bedrock and Vertex model names count),
+else the top-level `autoCompactWindow`, else the model's own window. `"auto"` means the model's own
+window. Other ways of setting it (see Limits) aren't read; at worst, a compaction point the hook
+gets wrong means that compaction happens as usual, without a handoff.
 
 The context size is the last response's input plus its output. Workflow agents' transcripts are
 found wherever they live.
@@ -108,14 +99,9 @@ gets one line saying where the file is, and reads it only if it needs to. A git 
 
 ### Subagents
 
-- **Read-only agents are never held**, since they couldn't write a handoff anyway; they compact
-  normally. That covers:
-  - agents whose definition's `tools` (an inline list, a `[...]` list, even over several lines, or a
-    YAML block list) has neither Write nor Edit;
-  - agents whose `disallowedTools` removes both;
-  - Explore and Plan.
-
-  A definition with `memory` gets Write and Edit back, so it isn't read-only.
+- **Explore and Plan agents are never held**, since they're told not to change files; they compact
+  normally. Every other agent is held whatever its tools: one without Write or Edit can still write
+  its handoff with Bash.
 - **Hold budget:** any other subagent is held for at most 12 attempts while its handoff is
   missing. A handoff being trimmed is held until the safety limit, like the main session's.
 
@@ -143,15 +129,13 @@ pruned and the slot is written again:
 ### Archive
 
 Loaded handoffs go to `~/.local/state/claude-handoffs/archive/<project
-folder>/<date>_<time>_<session>_<agent>.md` and are kept for good, each one once. Handoffs being
-pruned also get a `_before-trim` copy. A project handoff that git has committed and unchanged isn't
-copied, because its git history is the archive.
+folder>/<date>_<time>_<session>_<agent>.md` and are kept for good, each one once, project handoff
+files included. Handoffs being pruned also get a `_before-trim` copy.
 
 ### Other cases
 
 - `/compact` always goes through, and loads a handoff if one was written since the last compaction.
-- `/clear` loads the handoff of the session that was just cleared, linked through its SessionEnd
-  hook, never another session's in the same folder.
+- `/clear` starts afresh: a handoff written but not yet loaded stays in the old session's folder.
 - In plan mode the main session can't write files, so its compaction isn't held and Stop doesn't ask.
 - Models with a 200k window aren't held. They compact only about 30k below their limit, which
   leaves no room to wait safely. They compact as usual, without a handoff.
@@ -172,7 +156,7 @@ make uninstall   # undoes what install changed
 
 Installing changes `~/.claude/settings.json`, after backing it up next to itself:
 
-- copies the binary to `~/.claude/hooks/auto-handoff` and registers it for ten hook events. A
+- copies the binary to `~/.claude/hooks/auto-handoff` and registers it for nine hook events. A
   reinstall swaps in a new file rather than overwriting the old one: macOS can otherwise keep killing
   a binary that was rewritten while a hook was running it.
 - allows Read/Edit/Write on `~/.local/state/claude-handoffs/**`
@@ -220,13 +204,12 @@ allow rule.
 
 - `make test`: unit tests for the hook (driving the binary with hook events) and for the installer
   (against a throwaway config folder).
-- `make live`: six scenarios in real headless sessions on Sonnet with a 100k window. Each run uses a
-  fresh folder under `~/.local/state/claude-handoffs-livetest/` and deletes nothing. Costs about
-  $3.30.
+- `make live`: five scenarios in real headless sessions on Sonnet, with a 100k window set for the
+  model in settings. Each run uses a fresh folder under `~/.local/state/claude-handoffs-livetest/`
+  and deletes nothing. Costs about $3.
   - main session: reminded mid-turn;
   - Stop hook: asks for the handoff at the end of a turn;
-  - parallel subagents: each gets its own handoff back;
-  - model settings: subagents follow the per-model window;
+  - parallel subagents: each gets its own handoff back, and follow the per-model window;
   - project handoff: updated in place;
   - two cycles: the second handoff is a rewrite.
 
@@ -254,8 +237,10 @@ of it undocumented:
   that's recovered.
 - **Blocked tool calls:** a tool call that another PreToolUse hook blocks leaves no event behind. The
   agent that made it is then found by size alone.
-- **Settings the hook can't see:** a project's own `autoCompactWindow`, one passed with
-  `--settings`, and windows tuned by the server.
+- **Settings the hook doesn't read:** `CLAUDE_CODE_AUTO_COMPACT_WINDOW`,
+  `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, a subagent definition's own `autoCompactWindow`, a project's own
+  setting, one passed with `--settings`, and windows tuned by the server. Agents they apply to may
+  compact as usual, without a handoff.
 - **Other projects' PreCompact hooks** run on every held attempt too, so a slow one slows each
   request while a compaction waits. Pruning a big handoff can take dozens of requests. Their
   SessionStart(compact) output can also come before the note.
