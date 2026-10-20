@@ -192,6 +192,39 @@ class HookTest(unittest.TestCase):
         self.tokens("main", 300_000)
         self.hold()
 
+    def autocompact(self, window):
+        """/autocompact in this session: Claude Code saves the window, then notes it in the transcript."""
+        self.settings({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": window}}})
+        self.append("main", {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text":
+            "<local-command-stdout>Auto-compact window for Opus 5.5 set to %dk tokens</local-command-stdout>\n"
+            % (window // 1000)}]}})
+
+    def test_a_window_changed_in_another_session_doesnt_apply_here(self):
+        # Claude Code keeps the window a session started with, and so does the hook.
+        self.settings({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 333000}}})
+        self.run_hook("SessionStart", source="startup")
+        self.settings({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 433000}}})  # elsewhere
+        self.hold()  # still at about 300k here
+        self.run_hook("SessionStart", source="resume")  # a resumed session reads it again
+        self.tokens("main", 301_000)
+        self.tool()
+        self.assertEqual(list(self.agents()["main"]), ["compacted"])  # no longer waiting at 300k
+        self.assertFalse(self.blocked(self.compact()))
+
+    def test_autocompact_in_this_session_applies_here(self):
+        self.settings({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 333000}}})
+        self.run_hook("SessionStart", source="startup")
+        self.autocompact(433000)
+        self.tool()
+        self.assertFalse(self.blocked(self.compact()))  # 300k: below the new point, about 400k
+        self.settings({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 733000}}})  # then elsewhere
+        self.tokens("main", 400_000)
+        self.hold()
+        # The dialog form leaves the window as it was: nothing to take again.
+        self.append("main", {"type": "user", "message": {"role": "user", "content":
+            "<local-command-stdout>Auto-compact window for Opus 5.5 unchanged: 433k tokens</local-command-stdout>"}})
+        self.hold()
+
     def test_switching_off_while_held_lets_the_agent_go(self):
         # /autocompact auto, or a window past about 890k: the hook is off, so main stops waiting at once,
         # even when still close to the new compaction point.

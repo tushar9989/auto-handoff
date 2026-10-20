@@ -4,8 +4,8 @@
 // Every hook event runs this one binary (see README.md for the flow). Per-session state lives in
 // ~/.local/state/claude-handoffs/<session_id>/: a <agent>.md slot per agent ("main", or a subagent's
 // agent_id), state.json, crossing/<agent> (that agent's next request reaches its compaction point),
-// types/<agent> (its agent_type), paths/<agent> (where that subagent's transcript is) and
-// modes/<agent> (its permission mode).
+// types/<agent> (its agent_type), paths/<agent> (where that subagent's transcript is),
+// modes/<agent> (its permission mode) and windows.json (the auto-compact windows the session uses).
 //
 // Writing the slot is the signal that the handoff is ready. The slot holds the handoff itself, or the
 // path of a handoff file the session already keeps (say a HANDOFF.md in the project), which stays
@@ -32,7 +32,9 @@
 // - each compaction writes a compact_boundary line into the compacted agent's own transcript;
 // - the summarizer doesn't see the most recent messages, which are kept word for word after it;
 // - PreCompact's plain stdout, when it doesn't block, is added to the summary prompt, for subagents too;
-// - hook context over 10,000 characters is moved to a file.
+// - hook context over 10,000 characters is moved to a file;
+// - a session reads its auto-compact windows from settings when it starts or resumes, and again when
+//   /autocompact runs in it, which notes "Auto-compact window for ... set to ..." in the transcript.
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -194,7 +196,7 @@ const char* kSummaryInstructions =
     "the conversation never names that path, ignore this note and write the full summary as usual.";
 
 struct Config {
-  std::string root, log, config_dir, settings;
+  std::string root, log, config_dir, settings, windows;
 } cfg;
 
 // ---- A small JSON value: enough for hook input, transcript lines and our own state file.
@@ -1004,18 +1006,69 @@ double window(const std::string& model) {
   return kDefaultWindow;
 }
 
+// ---- The auto-compact windows a session uses.
+//
+// Claude Code reads the windows from settings when a session starts or resumes, and again when
+// /autocompact runs in it; a window changed in another session doesn't reach one already open. So the
+// hook keeps each session's own copy in windows.json, taken at the same moments, and goes by that. A
+// session that started before the hook was installed goes by settings.json.
+
+const char* const kAutocompactSet = "\"<local-command-stdout>Auto-compact window for ";
+
+// The windows in a settings file: the top-level one and each model's.
+Json windows_in(const Json& s) {
+  Json w = Json::object(), models = Json::object();
+  if (const Json* v = s.get("autoCompactWindow")) w.at("autoCompactWindow") = *v;
+  if (const Json* ms = s.get("modelSettings"))
+    for (const auto& f : ms->fields)
+      if (const Json* v = f.second.get("autoCompactWindow")) models.at(f.first).at("autoCompactWindow") = *v;
+  w.at("modelSettings") = models;
+  return w;
+}
+
+// The session's copy, taken now. The transcript up to here has been looked through.
+void copy_windows(const std::string& d, const std::string& transcript) {
+  std::string text, out;
+  Json s;
+  if (read_file(cfg.settings, text)) Parser(text).parse(s);
+  dump(windows_in(s), out);
+  mkdirs(d);
+  write_atomic(d + "/windows.json", out);
+  write_atomic(d + "/windows.scanned", std::to_string(std::max(0L, file_size(transcript))));
+}
+
+// A new copy when /autocompact has run in the session since the last look through its transcript.
+void follow_autocompact(const std::string& d, const std::string& transcript) {
+  std::string seen;
+  if (transcript.empty() || !read_file(d + "/windows.scanned", seen)) return;
+  long from = atol(seen.c_str()), size = file_size(transcript);
+  if (size < 0) return;
+  if (size <= from) {
+    if (size < from) write_atomic(d + "/windows.scanned", std::to_string(size));  // rewritten: start again here
+    return;
+  }
+  std::string added;
+  read_file(transcript, added, std::min<long>(size - from, kTranscriptDeep));
+  for (size_t at = added.find(kAutocompactSet); at != std::string::npos; at = added.find(kAutocompactSet, at + 1)) {
+    size_t end = added.find('<', at + strlen(kAutocompactSet));  // "set to 433k tokens", not "unchanged"
+    if (added.substr(at, end - at).find(" set to ") != std::string::npos) return copy_windows(d, transcript);
+  }
+  write_atomic(d + "/windows.scanned", std::to_string(size));
+}
+
 const Json& settings() {
   static bool loaded = false;
   static Json parsed;
   if (!loaded) {
     loaded = true;
     std::string text;
-    if (read_file(cfg.settings, text)) Parser(text).parse(parsed);
+    if ((!cfg.windows.empty() && read_file(cfg.windows, text)) || read_file(cfg.settings, text))
+      Parser(text).parse(parsed);
   }
   return parsed;
 }
 
-// The auto-compact window set for a model in the user's settings (by /autocompact): its modelSettings
+// The auto-compact window set for a model (by /autocompact), as the session sees it: its modelSettings
 // entry, else the top-level setting. "auto", or nothing set, is 0.
 double configured_window(const std::string& model) {
   const Json* ms = settings().get("modelSettings");
@@ -1668,7 +1721,12 @@ void run(const Json& in) {
   std::string ev = in.str("hook_event_name"), sid = in.str("session_id"), agent = in.str("agent_id");
   if (agent.empty()) agent = "main";
   if (!safe_id(sid) || !safe_id(agent)) return;
-  std::string d = cfg.root + "/" + sid;
+  std::string d = cfg.root + "/" + sid, src = in.str("source");
+  if (ev == "SessionStart" && (src == "startup" || src == "resume"))
+    copy_windows(d, in.str("transcript_path"));
+  else
+    follow_autocompact(d, in.str("transcript_path"));
+  cfg.windows = d + "/windows.json";
   if (ev == "SessionStart") on_session_start(in, d);
   else if (ev == "SubagentStart") on_subagent_start(in, d, agent);
   else if (ev == "SubagentStop") on_subagent_stop(in, d, agent);

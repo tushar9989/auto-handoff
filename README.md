@@ -18,8 +18,8 @@ Installing registers the hook in `~/.claude/settings.json` (backed up first) and
 Switch it on in any session with `/autocompact 333k`. Compaction then starts about 33k below the
 window, at about 300k tokens; `/autocompact 733k` would start it at about 700k. The setting applies to
 the model you're using, in that session and in sessions started or resumed after it. Sessions already
-open keep the window they started with, so run it in each of them too. `/autocompact auto`, or a window
-above about 890k, switches it off again.
+open keep the window they started with, and the hook follows each session's own window, so run it in
+each session you want changed. `/autocompact auto`, or a window above about 890k, switches it off again.
 
 ## How it works
 
@@ -73,9 +73,11 @@ lookup of the agent's id.
 
 ## Limits
 
-- The hook reads only the window in `settings.json`, which is what `/autocompact` writes. It ignores
-  the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var and per-project windows. A subagent whose definition
-  sets its own `autoCompactWindow` compacts without a handoff, and main may be held in its place.
+- The hook reads only the window in `settings.json`, which is what `/autocompact` writes, when a session
+  starts or resumes and when `/autocompact` runs in it. A session already open when the hook was installed
+  goes by `settings.json` as it is now. It ignores the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var and
+  per-project windows. A subagent whose definition sets its own `autoCompactWindow` compacts without a
+  handoff, and main may be held in its place.
 - Other PreCompact hooks run on every held attempt, so a slow one slows each request while a compaction
   waits.
 - A handoff still over 9,000 characters after one prune goes through as it is.
