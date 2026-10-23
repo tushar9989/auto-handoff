@@ -1011,7 +1011,7 @@ double window(const std::string& model) {
 // Claude Code reads the windows from settings when a session starts or resumes, and again when
 // /autocompact runs in it; a window changed in another session doesn't reach one already open. So the
 // hook keeps each session's own copy in windows.json, taken at the same moments, and goes by that. A
-// session that started before the hook was installed goes by settings.json.
+// session that started before the hook was installed goes by settings.json until /autocompact runs in it.
 
 const char* const kAutocompactSet = "\"<local-command-stdout>Auto-compact window for ";
 
@@ -1040,9 +1040,13 @@ void copy_windows(const std::string& d, const std::string& transcript) {
 // A new copy when /autocompact has run in the session since the last look through its transcript.
 void follow_autocompact(const std::string& d, const std::string& transcript) {
   std::string seen;
-  if (transcript.empty() || !read_file(d + "/windows.scanned", seen)) return;
-  long from = atol(seen.c_str()), size = file_size(transcript);
+  long size = transcript.empty() ? -1 : file_size(transcript);
   if (size < 0) return;
+  if (!read_file(d + "/windows.scanned", seen)) {  // open since before the install: follow it from here
+    mkdirs(d);
+    return write_atomic(d + "/windows.scanned", std::to_string(size));
+  }
+  long from = atol(seen.c_str());
   if (size <= from) {
     if (size < from) write_atomic(d + "/windows.scanned", std::to_string(size));  // rewritten: start again here
     return;

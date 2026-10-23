@@ -75,9 +75,9 @@ lookup of the agent's id.
 
 - The hook reads only the window in `settings.json`, which is what `/autocompact` writes, when a session
   starts or resumes and when `/autocompact` runs in it. A session already open when the hook was installed
-  goes by `settings.json` as it is now. It ignores the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var and
-  per-project windows. A subagent whose definition sets its own `autoCompactWindow` compacts without a
-  handoff, and main may be held in its place.
+  goes by `settings.json` until `/autocompact` runs in it. It ignores the `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
+  env var and per-project windows. A subagent whose definition sets its own `autoCompactWindow` compacts
+  without a handoff, and main may be held in its place.
 - Other PreCompact hooks run on every held attempt, so a slow one slows each request while a compaction
   waits.
 - A handoff still over 9,000 characters after one prune goes through as it is.

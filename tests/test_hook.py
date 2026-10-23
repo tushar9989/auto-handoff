@@ -225,6 +225,16 @@ class HookTest(unittest.TestCase):
             "<local-command-stdout>Auto-compact window for Opus 5.5 unchanged: 433k tokens</local-command-stdout>"}})
         self.hold()
 
+    def test_autocompact_in_a_session_open_since_before_the_install_applies_there(self):
+        # No SessionStart seen: it goes by settings.json until /autocompact runs in it.
+        self.tool()
+        self.autocompact(433000)
+        self.tool()
+        self.settings({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 333000}}})  # then elsewhere
+        self.tokens("main", 300_000)
+        self.tool()
+        self.assertFalse(self.blocked(self.compact()))  # its own point is about 400k
+
     def test_switching_off_while_held_lets_the_agent_go(self):
         # /autocompact auto, or a window past about 890k: the hook is off, so main stops waiting at once,
         # even when still close to the new compaction point.
