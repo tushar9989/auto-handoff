@@ -3,20 +3,22 @@
 //
 // Every hook event runs this one binary (see README.md for the flow). Per-session state lives in
 // ~/.local/state/claude-handoffs/<session_id>/: a <agent>.md slot per agent ("main", or a subagent's
-// agent_id), state.json, crossing/<agent> (that agent's next request reaches its compaction point),
-// types/<agent> (its agent_type), paths/<agent> (where that subagent's transcript is),
-// modes/<agent> (its permission mode) and windows.json (the auto-compact windows the session uses).
+// agent_id), state.json, recent/<agent> (that agent's size at its latest request), types/<agent> (its
+// agent_type), paths/<agent> (where that subagent's transcript is) and modes/<agent> (its permission
+// mode).
 //
 // Writing the slot is the signal that the handoff is ready. The slot holds the handoff itself, or the
 // path of a handoff file the session already keeps (say a HANDOFF.md in the project), which stays
 // where it is. Loaded handoffs, and handoffs about to be trimmed, are copied to archive/<project
 // folder>/ and never pruned.
 //
-// Claude Code's compaction hooks don't say which agent is compacting. So before each request an agent
-// makes, the hook works out whether it reaches the agent's compaction point, the way Claude Code
-// does, and if so the agent announces itself in crossing/<agent>. PreCompact follows within
-// milliseconds and takes the newest announcement. After compaction each agent picks its own handoff
-// from labelled candidates, because SessionStart(compact) doesn't say whose context it is either.
+// The hook doesn't need to know where a session compacts: a session keeps its own copy of the window,
+// which no hook can read. When PreCompact comes, Claude Code has decided, and the hook holds it if a
+// window is set for the model. But Claude Code's compaction hooks don't say which agent is compacting.
+// So before each request an agent makes, the hook notes its size, the way Claude Code counts it, in
+// recent/<agent>. PreCompact follows within milliseconds and takes the agent heard from a moment ago
+// that is furthest past its compaction point. After compaction each agent picks its own handoff from
+// labelled candidates, because SessionStart(compact) doesn't say whose context it is either.
 //
 // Hooks run before every request, so this is a dependency-free native binary that skips the parts of
 // its input it doesn't need.
@@ -32,9 +34,7 @@
 // - each compaction writes a compact_boundary line into the compacted agent's own transcript;
 // - the summarizer doesn't see the most recent messages, which are kept word for word after it;
 // - PreCompact's plain stdout, when it doesn't block, is added to the summary prompt, for subagents too;
-// - hook context over 10,000 characters is moved to a file;
-// - a session reads its auto-compact windows from settings when it starts or resumes, and again when
-//   /autocompact runs in it, which notes "Auto-compact window for ... set to ..." in the transcript.
+// - hook context over 10,000 characters is moved to a file.
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -63,16 +63,16 @@ extern char** environ;
 
 namespace {
 
-const double kHoldRoom = 150000;           // hold at most this far past the compaction point (450k at 300k)
+const double kHoldRoom = 150000;           // hold at most this far past where compaction first came (450k at 300k)
 const double kDefaultWindow = 200000;      // unknown model: assume a small window, which leaves the hook off
 const double kWindowShare = 0.9;           // never hold past this share of the model's real window
 const double kTriggerGap = 33000;          // auto-compact fires about this far below its window
-const double kTriggerSlack = 50000;        // with no agent announced, main is held only this close to its trigger
-const double kAnnounceSlack = 3000;        // an agent this close to its trigger after a request announces it
-const double kAnnounceSeconds = 5;         // PreCompact follows the compacting agent's announcement within this
+const double kMinPoint = 100000 - kTriggerGap;  // the lowest compaction point a window allows (100k)
+const double kShrink = 50000;              // a held agent whose context shrank this far stops waiting
+const double kRecentSeconds = 5;           // PreCompact follows the compacting agent's last request within this
 const double kBytesPerToken = 3;           // Claude Code's size estimate for the 1M-window models (older: 4)
 const double kMediaTokens = 2000;          // and for each image or document
-const double kMinRoom = 40000;             // hold only where the safety limit is this far above the trigger
+const double kMinRoom = 40000;             // on only where the safety limit can be this far past the point
 const double kStaleGrowth = 20000;         // a handoff the context has grown this far past is asked for again
 const size_t kInjectCap = 9500;            // Claude Code moves hook context over 10,000 chars to a file
 const long kHandoffCap = 9000;             // a longer handoff holds compaction until it's trimmed
@@ -196,7 +196,7 @@ const char* kSummaryInstructions =
     "the conversation never names that path, ignore this note and write the full summary as usual.";
 
 struct Config {
-  std::string root, log, config_dir, settings, windows;
+  std::string root, log, config_dir, settings;
 } cfg;
 
 // ---- A small JSON value: enough for hook input, transcript lines and our own state file.
@@ -1006,73 +1006,18 @@ double window(const std::string& model) {
   return kDefaultWindow;
 }
 
-// ---- The auto-compact windows a session uses.
-//
-// Claude Code reads the windows from settings when a session starts or resumes, and again when
-// /autocompact runs in it; a window changed in another session doesn't reach one already open. So the
-// hook keeps each session's own copy in windows.json, taken at the same moments, and goes by that. A
-// session that started before the hook was installed goes by settings.json until /autocompact runs in it.
-
-const char* const kAutocompactSet = "\"<local-command-stdout>Auto-compact window for ";
-
-// The windows in a settings file: the top-level one and each model's.
-Json windows_in(const Json& s) {
-  Json w = Json::object(), models = Json::object();
-  if (const Json* v = s.get("autoCompactWindow")) w.at("autoCompactWindow") = *v;
-  if (const Json* ms = s.get("modelSettings"))
-    for (const auto& f : ms->fields)
-      if (const Json* v = f.second.get("autoCompactWindow")) models.at(f.first).at("autoCompactWindow") = *v;
-  w.at("modelSettings") = models;
-  return w;
-}
-
-// The session's copy, taken now. The transcript up to here has been looked through.
-void copy_windows(const std::string& d, const std::string& transcript) {
-  std::string text, out;
-  Json s;
-  if (read_file(cfg.settings, text)) Parser(text).parse(s);
-  dump(windows_in(s), out);
-  mkdirs(d);
-  write_atomic(d + "/windows.json", out);
-  write_atomic(d + "/windows.scanned", std::to_string(std::max(0L, file_size(transcript))));
-}
-
-// A new copy when /autocompact has run in the session since the last look through its transcript.
-void follow_autocompact(const std::string& d, const std::string& transcript) {
-  std::string seen;
-  long size = transcript.empty() ? -1 : file_size(transcript);
-  if (size < 0) return;
-  if (!read_file(d + "/windows.scanned", seen)) {  // open since before the install: follow it from here
-    mkdirs(d);
-    return write_atomic(d + "/windows.scanned", std::to_string(size));
-  }
-  long from = atol(seen.c_str());
-  if (size <= from) {
-    if (size < from) write_atomic(d + "/windows.scanned", std::to_string(size));  // rewritten: start again here
-    return;
-  }
-  std::string added;
-  read_file(transcript, added, std::min<long>(size - from, kTranscriptDeep));
-  for (size_t at = added.find(kAutocompactSet); at != std::string::npos; at = added.find(kAutocompactSet, at + 1)) {
-    size_t end = added.find('<', at + strlen(kAutocompactSet));  // "set to 433k tokens", not "unchanged"
-    if (added.substr(at, end - at).find(" set to ") != std::string::npos) return copy_windows(d, transcript);
-  }
-  write_atomic(d + "/windows.scanned", std::to_string(size));
-}
-
 const Json& settings() {
   static bool loaded = false;
   static Json parsed;
   if (!loaded) {
     loaded = true;
     std::string text;
-    if ((!cfg.windows.empty() && read_file(cfg.windows, text)) || read_file(cfg.settings, text))
-      Parser(text).parse(parsed);
+    if (read_file(cfg.settings, text)) Parser(text).parse(parsed);
   }
   return parsed;
 }
 
-// The auto-compact window set for a model (by /autocompact), as the session sees it: its modelSettings
+// The auto-compact window set for a model in the user's settings (by /autocompact): its modelSettings
 // entry, else the top-level setting. "auto", or nothing set, is 0.
 double configured_window(const std::string& model) {
   const Json* ms = settings().get("modelSettings");
@@ -1086,21 +1031,20 @@ double trigger_for(double native, double configured) {
   return (configured > 0 ? std::min(native, configured) : native) - kTriggerGap;
 }
 
-// The safety limit: past it, compaction goes through without a handoff.
-double limit_for(double native, double configured) {
-  return std::min(trigger_for(native, configured) + kHoldRoom, kWindowShare * native);
-}
+// The safety limit for a compaction that first came at `tokens`: past it, it goes through without a
+// handoff.
+double limit_for(double native, double tokens) { return std::min(tokens + kHoldRoom, kWindowShare * native); }
 
-// Whether the hook is on: a 1M model whose compaction point leaves room to wait below the safety limit.
-// That takes a window set with /autocompact, up to about 890k. The model's own window ("auto", or nothing
-// set) puts the point past the limit: off. A 200k model is off whatever its window: Claude Code refuses
-// its requests from 177k, too close to wait safely.
+// Whether the hook is on: a 1M model with a window set (by /autocompact) that leaves room to wait below
+// the safety limit, up to about 890k. The model's own window ("auto", or nothing set) puts the point past
+// the limit: off. A 200k model is off whatever its window: Claude Code refuses its requests from 177k, too
+// close to wait safely.
 bool on_for(double native, double configured) {
-  return native >= 1e6 && limit_for(native, configured) - trigger_for(native, configured) >= kMinRoom;
+  double point = trigger_for(native, configured);
+  return native >= 1e6 && limit_for(native, point) - point >= kMinRoom;
 }
 
 double trigger_point(const std::string& model) { return trigger_for(window(model), configured_window(model)); }
-double safety_limit(const std::string& model) { return limit_for(window(model), configured_window(model)); }
 bool holds(const std::string& model) { return on_for(window(model), configured_window(model)); }
 
 // Whether it's on for a session: by the model its transcript shows, else (a new session) by any window
@@ -1126,53 +1070,59 @@ struct Candidate {
   bool on = false;        // the hook is on for its model (see holds)
 };
 
-// `announced` is the agent's own estimate of the request being made, if it gave one.
-Candidate candidate(const std::string& d, const std::string& transcript, const std::string& agent, double announced) {
+// `noted` is the agent's own size for the request being made, if it gave one. The safety limit is set
+// from where its compaction first came; one already waiting keeps its own (see the_limit).
+Candidate candidate(const std::string& d, const std::string& transcript, const std::string& agent, double noted) {
   Candidate c;
   c.agent = agent;
   c.u = usage(transcript_of(d, transcript, agent), agent == "main");
-  if (c.u.tokens > 0) c.u.tokens = std::max(c.u.tokens, announced);
+  if (c.u.tokens > 0) c.u.tokens = std::max(c.u.tokens, noted);
   c.info = agent_info(d, agent);
   c.trigger = trigger_point(c.u.model);
-  c.limit = safety_limit(c.u.model);
+  c.limit = limit_for(window(c.u.model), c.u.tokens);
   c.at_limit = c.u.tokens >= c.limit;
   c.on = holds(c.u.model);
   return c;
 }
 
-// Before an agent's next request: whether it crosses the agent's compaction point. `added` is what the
-// request adds to the latest one (tool results, a prompt), in tokens as Claude Code estimates them. If
-// it crosses, crossing/<agent> says so for PreCompact, which follows within milliseconds. Returns the
-// agent's latest size.
-Usage announce(const std::string& d, const std::string& transcript, const std::string& agent, double added) {
+// The safety limit of an agent already waiting: the one set when its compaction first came.
+void the_limit(Candidate& c, const Json& st) {
+  const Json* a = st.get("agents")->get(c.agent);
+  if (!a || !a->has("pending") || !a->has("limit")) return;
+  c.limit = a->num("limit");
+  c.at_limit = c.u.tokens >= c.limit;
+}
+
+// Before an agent's next request: its size as Claude Code counts it, in recent/<agent>. `added` is what
+// the request adds to the latest one (tool results, a prompt). Returns the agent's latest size.
+Usage note_size(const std::string& d, const std::string& transcript, const std::string& agent, double added) {
   Usage u = usage(transcript_of(d, transcript, agent), agent == "main");
-  std::string p = d + "/crossing/" + agent;
-  if (u.tokens > 0 && u.tokens + added >= trigger_point(u.model) - kAnnounceSlack) {
-    if (mtime(d + "/crossing") < 0) mkdirs(d + "/crossing");
-    write_atomic(p, std::to_string(long(u.tokens + added)));
-  } else if (mtime(p) >= 0) {
-    unlink(p.c_str());
+  if (u.tokens > 0) {
+    if (mtime(d + "/recent") < 0) mkdirs(d + "/recent");
+    write_atomic(d + "/recent/" + agent, std::to_string(long(u.tokens + added)));
   }
   return u;
 }
 
-// Who is compacting: the agent whose announcement is newest, if it's from a moment ago. PreCompact
-// follows its own agent's announcement by about 40ms, so another agent's would have to land in between.
-// With none (a request no hook saw coming, such as a background agent's report reaching main), the main
-// session, if it's near its compaction point.
+// Who is compacting. PreCompact follows the compacting agent's own request by about 40ms, so it's one of
+// the agents heard from a moment ago: the one furthest past its compaction point. Agents on a model
+// share a window, so the one compacting is at least as far along as any that isn't. With none heard from
+// (a request no hook saw coming, such as a background agent's report reaching main, or idle compaction),
+// the main session. Below the lowest point any window allows, it isn't an auto-compaction to wait on.
 bool compacting(const std::string& d, const std::string& transcript, double t, Candidate& out) {
-  std::string newest, est;
-  double newest_t = t - kAnnounceSeconds;
-  for (const auto& agent : list_dir(d + "/crossing")) {
-    double m = mtime(d + "/crossing/" + agent);
-    if (m >= newest_t) newest = agent, newest_t = m;
+  bool found = false;
+  double out_t = 0;
+  for (const auto& agent : list_dir(d + "/recent")) {
+    std::string p = d + "/recent/" + agent, est;
+    double m = mtime(p);
+    if (m < t - kRecentSeconds || !read_file(p, est)) continue;
+    Candidate c = candidate(d, transcript, agent, atof(est.c_str()));
+    if (c.u.tokens <= 0) continue;  // compacted since
+    double ahead = c.u.tokens - c.trigger, best = out.u.tokens - out.trigger;
+    if (!found || ahead > best || (ahead == best && m > out_t)) out = c, out_t = m, found = true;  // a tie: the latest
   }
-  if (!newest.empty() && read_file(d + "/crossing/" + newest, est)) {
-    out = candidate(d, transcript, newest, atof(est.c_str()));
-    if (out.u.tokens > 0) return true;
-  }
-  out = candidate(d, transcript, "main", 0);
-  return out.u.tokens > 0 && out.u.tokens >= out.trigger - kTriggerSlack;
+  if (!found) out = candidate(d, transcript, "main", 0);
+  return out.u.tokens >= kMinPoint;
 }
 
 // ---- Messages.
@@ -1312,7 +1262,7 @@ void archive_once(const std::string& d, const std::string& agent, Json& a, const
 }
 
 void release(const std::string& d, const std::string& agent, Json& a, const std::string& why, const std::string& cwd) {
-  unlink((d + "/crossing/" + agent).c_str());
+  unlink((d + "/recent/" + agent).c_str());  // its size is stale until the compaction shows in its transcript
   set(a, "released", now());
   a.at("why") = Json::string(why);
   if (why != "handoff") return;
@@ -1424,7 +1374,7 @@ void on_session_start(const Json& in, const std::string& d) {
 void on_subagent_start(const Json& in, const std::string& d, const std::string& agent) {
   std::string type = in.str("agent_type");
   if (type.empty()) return;  // Claude Code's own helpers, such as the compaction summarizer
-  announce(d, in.str("transcript_path"), agent, 0);  // a resumed subagent can compact before its first tool call
+  note_size(d, in.str("transcript_path"), agent, 0);  // a resumed subagent can compact before its first tool call
   mkdirs(d + "/types");
   write_atomic(d + "/types/" + agent, type);
   log(d, "subagent " + agent + " (" + type + (read_only(type) ? ", read-only" : "") + ") started");
@@ -1434,7 +1384,7 @@ void on_subagent_start(const Json& in, const std::string& d, const std::string& 
 
 void on_subagent_stop(const Json& in, const std::string& d, const std::string& agent) {
   if (in.str("agent_type").empty()) return;
-  for (const char* sub : {"/types/", "/paths/", "/crossing/", "/modes/"}) unlink((d + sub + agent).c_str());
+  for (const char* sub : {"/types/", "/paths/", "/recent/", "/modes/"}) unlink((d + sub + agent).c_str());
   if (!load_state(d).get("agents")->has(agent)) return;
   Lock lock(d);
   Json st = load_state(d);
@@ -1457,7 +1407,7 @@ bool planning(const std::string& d, const std::string& agent) {
 
 // After its compaction, or once its transcript shows it was compacted some other way, an agent is no
 // longer waiting. Nor is one the hook is now off for (its window was changed), or one whose context
-// shrank well below its compaction point without one (say a rewind): `u` is its latest size.
+// shrank well below where it was held without one (say a rewind): `u` is its latest size.
 void settle_if_compacted(const std::string& d, const Json& in, const std::string& agent, Json& st, Json& a,
                          const Usage& u) {
   std::string transcript = transcript_of(d, in.str("transcript_path"), agent);
@@ -1486,7 +1436,7 @@ void settle_if_compacted(const std::string& d, const Json& in, const std::string
     log(d, agent + " is no longer held: the hook is off for " + u.model + " now");
     return settle(a);
   }
-  if (u.tokens >= 0 && u.tokens < trigger_point(u.model) - kTriggerSlack) {
+  if (u.tokens >= 0 && u.tokens < a.num("tokens") - kShrink) {
     log(d, agent + "'s context shrank to " + std::to_string(long(u.tokens)) + " tokens without a compaction; no longer waiting");
     settle(a);
   }
@@ -1495,11 +1445,11 @@ void settle_if_compacted(const std::string& d, const Json& in, const std::string
 // Whether an agent has anything going on: waiting, or just released.
 bool busy(const Json* a) { return a && (a->has("pending") || a->has("released")); }
 
-// A batch of tool results or a new prompt, just before the agent's next request: announce it if it
-// crosses the compaction point, and remind an agent that is holding up its own compaction.
+// A batch of tool results or a new prompt, just before the agent's next request: note its size, and
+// remind an agent that is holding up its own compaction.
 void on_activity(const Json& in, const std::string& d, const std::string& agent, const std::string& ev) {
   note_mode(d, agent, in.str("permission_mode"));
-  Usage u = announce(d, in.str("transcript_path"), agent, in.num("added"));
+  Usage u = note_size(d, in.str("transcript_path"), agent, in.num("added"));
   {
     Json st = load_state(d);  // most calls end here, without the lock
     if (!busy(st.get("agents")->get(agent))) return;
@@ -1560,9 +1510,9 @@ void on_stop(const Json& in, const std::string& d, const std::string& agent) {
     if (!busy(st.get("agents")->get(agent))) return;
   }
   Usage u = usage(transcript_of(d, in.str("transcript_path"), agent), agent == "main");
-  // Blocking keeps the turn going: its next request is announced like any other.
+  // Blocking keeps the turn going: its next request is noted like any other.
   auto go_on = [&](const std::string& text) {
-    announce(d, in.str("transcript_path"), agent, 0);
+    note_size(d, in.str("transcript_path"), agent, 0);
     block(text);
   };
   Json a;
@@ -1695,10 +1645,11 @@ void on_pre_compact(const Json& in, const std::string& d) {
 
   Candidate c;
   if (!compacting(d, in.str("transcript_path"), t, c))
-    return log(d, "compaction allowed: no agent is at its compaction point");
+    return log(d, "compaction allowed: below any compaction point (" + std::to_string(long(c.u.tokens)) + " tokens)");
   if (!c.on) return log(d, "compaction of " + c.agent + " allowed: the hook is off for its model");
   Lock lock(d);
   Json st = load_state(d);
+  the_limit(c, st);
   std::string cwd = st.str("cwd").empty() ? in.str("cwd") : st.str("cwd");
   if (wants_hold(d, st, c)) {
     hold(d, st, c, t, cwd);
@@ -1725,12 +1676,7 @@ void run(const Json& in) {
   std::string ev = in.str("hook_event_name"), sid = in.str("session_id"), agent = in.str("agent_id");
   if (agent.empty()) agent = "main";
   if (!safe_id(sid) || !safe_id(agent)) return;
-  std::string d = cfg.root + "/" + sid, src = in.str("source");
-  if (ev == "SessionStart" && (src == "startup" || src == "resume"))
-    copy_windows(d, in.str("transcript_path"));
-  else
-    follow_autocompact(d, in.str("transcript_path"));
-  cfg.windows = d + "/windows.json";
+  std::string d = cfg.root + "/" + sid;
   if (ev == "SessionStart") on_session_start(in, d);
   else if (ev == "SubagentStart") on_subagent_start(in, d, agent);
   else if (ev == "SubagentStop") on_subagent_stop(in, d, agent);

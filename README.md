@@ -18,8 +18,9 @@ Installing registers the hook in `~/.claude/settings.json` (backed up first) and
 Switch it on in any session with `/autocompact 333k`. Compaction then starts about 33k below the
 window, at about 300k tokens; `/autocompact 733k` would start it at about 700k. The setting applies to
 the model you're using, in that session and in sessions started or resumed after it. Sessions already
-open keep the window they started with, and the hook follows each session's own window, so run it in
-each session you want changed. `/autocompact auto`, or a window above about 890k, switches it off again.
+open keep the window they started with, so run it in each one you want changed. The hook doesn't need
+to know a session's window: it acts when Claude Code starts a compaction, for any model with a window
+set. `/autocompact auto`, or a window above about 890k, switches it off again.
 
 ## How it works
 
@@ -33,7 +34,7 @@ each session you want changed. `/autocompact auto`, or a window above about 890k
    words, since the handoff has the details.
 4. **Load.** The fresh context opens with "A note from the user: make no mistakes. I love you.", then
    the handoff.
-5. **Safety limit.** 150k past the start (450k for a 300k start), or at 900k if that comes first,
+5. **Safety limit.** 150k past where compaction first came (450k for a 300k start), and at most at 900k,
    compaction goes through without a handoff rather than risk a failed request.
 
 The handoff request asks for a rewrite rather than an append: where things stand now, finished work
@@ -50,13 +51,14 @@ input carries the main session's id, even though Claude Code has the agent's id 
 a hook can't tell whose handoff to wait for or load. Guessing from which transcript changed last fails
 with parallel subagents.
 
-So each agent announces itself instead. The hooks that run just before each request do carry the
-agent's id: after each batch of tool calls, on a prompt, and on a Stop the hook blocks. There, the hook
-repeats Claude Code's own size check, and notes the agent whose next request will cross its compaction
-point. PreCompact follows within about 40ms and takes that agent. If two agents cross in the same
-instant and the wrong one is taken, each still gets its own handoff back: handoffs are labelled by owner,
-and an agent that wasn't compacted goes back to waiting. Once #91910 is fixed, all of this becomes a
-lookup of the agent's id.
+So the hook goes by timing. The hooks that run just before each request do carry the agent's id: after
+each batch of tool calls, on a prompt, and on a Stop the hook blocks. There, the hook notes the agent's
+size, counted the way Claude Code counts it. PreCompact follows the compacting agent's own request within
+about 40ms, so the hook takes the agent heard from in the last few seconds that is furthest past its
+compaction point. Agents on one model share a window, so the one compacting is at least as far along as
+any other. If two agents compact in the same instant and the wrong one is taken, each still gets its own
+handoff back: handoffs are labelled by owner, and an agent that wasn't compacted goes back to waiting.
+Once #91910 is fixed, all of this becomes a lookup of the agent's id.
 
 ## Other cases
 
@@ -64,8 +66,9 @@ lookup of the agent's id.
   with a 200k window (too little room to wait). These compact as usual.
 - **`/compact`** always goes through, and loads a handoff if one was written.
 - **Idle compaction** (a Claude Code default) compacts sessions of 200k or more when you come back after
-  about an hour away. It saves re-reading the full context once the cache has expired, but it compacts
-  below your threshold, usually without a handoff. You can turn it off in `/config`.
+  about an hour away. It saves re-reading the full context once the cache has expired. The hook holds it
+  like any other, so the session writes a handoff first, below your usual threshold. You can turn it off
+  in `/config`.
 - **Summary precompute** writes the summary in the background before compaction is due. It's gated on
   Anthropic's side and may not be active for you. Going by Claude Code 2.1.302's code, a compaction
   that uses it never calls PreCompact, so nothing is held and no handoff is written. To be safe, set
@@ -73,16 +76,15 @@ lookup of the agent's id.
 
 ## Limits
 
-- The hook reads only the window in `settings.json`, which is what `/autocompact` writes, when a session
-  starts or resumes and when `/autocompact` runs in it. A session already open when the hook was installed
-  goes by `settings.json` until `/autocompact` runs in it. It ignores the `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
-  env var and per-project windows. A subagent whose definition sets its own `autoCompactWindow` compacts
-  without a handoff, and main may be held in its place.
+- The hook is on for a model when `settings.json` sets its window, which is what `/autocompact` writes. It
+  ignores the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var and per-project windows. A subagent whose
+  definition sets its own lower `autoCompactWindow` can be mistaken for main, if main made a request in
+  the same moment.
 - Other PreCompact hooks run on every held attempt, so a slow one slows each request while a compaction
   waits.
 - A handoff still over 9,000 characters after one prune goes through as it is.
-- A compaction Claude Code starts after an API error (say an oversized image), while a hold is on, is
-  held too, and that request fails. It hasn't been seen in practice.
+- A compaction Claude Code starts after an API error (say an oversized image) is held like any other,
+  and that request fails. It hasn't been seen in practice.
 
 ## Development
 

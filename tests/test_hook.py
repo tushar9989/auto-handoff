@@ -199,42 +199,6 @@ class HookTest(unittest.TestCase):
             "<local-command-stdout>Auto-compact window for Opus 5.5 set to %dk tokens</local-command-stdout>\n"
             % (window // 1000)}]}})
 
-    def test_a_window_changed_in_another_session_doesnt_apply_here(self):
-        # Claude Code keeps the window a session started with, and so does the hook.
-        self.settings({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 333000}}})
-        self.run_hook("SessionStart", source="startup")
-        self.settings({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 433000}}})  # elsewhere
-        self.hold()  # still at about 300k here
-        self.run_hook("SessionStart", source="resume")  # a resumed session reads it again
-        self.tokens("main", 301_000)
-        self.tool()
-        self.assertEqual(list(self.agents()["main"]), ["compacted"])  # no longer waiting at 300k
-        self.assertFalse(self.blocked(self.compact()))
-
-    def test_autocompact_in_this_session_applies_here(self):
-        self.settings({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 333000}}})
-        self.run_hook("SessionStart", source="startup")
-        self.autocompact(433000)
-        self.tool()
-        self.assertFalse(self.blocked(self.compact()))  # 300k: below the new point, about 400k
-        self.settings({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 733000}}})  # then elsewhere
-        self.tokens("main", 400_000)
-        self.hold()
-        # The dialog form leaves the window as it was: nothing to take again.
-        self.append("main", {"type": "user", "message": {"role": "user", "content":
-            "<local-command-stdout>Auto-compact window for Opus 5.5 unchanged: 433k tokens</local-command-stdout>"}})
-        self.hold()
-
-    def test_autocompact_in_a_session_open_since_before_the_install_applies_there(self):
-        # No SessionStart seen: it goes by settings.json until /autocompact runs in it.
-        self.tool()
-        self.autocompact(433000)
-        self.tool()
-        self.settings({"modelSettings": {"claude-opus-5-5": {"autoCompactWindow": 333000}}})  # then elsewhere
-        self.tokens("main", 300_000)
-        self.tool()
-        self.assertFalse(self.blocked(self.compact()))  # its own point is about 400k
-
     def test_switching_off_while_held_lets_the_agent_go(self):
         # /autocompact auto, or a window past about 890k: the hook is off, so main stops waiting at once,
         # even when still close to the new compaction point.
@@ -313,7 +277,12 @@ class HookTest(unittest.TestCase):
         self.assertIn("compaction is waiting", self.ctx(self.run_hook("UserPromptSubmit", prompt="next")))
 
     def test_safety_limit(self):
-        self.tokens("main", 460_000)
+        # 150k past where the compaction first came.
+        self.tokens("main", 320_000)
+        self.hold()
+        self.tokens("main", 465_000)
+        self.hold()
+        self.tokens("main", 471_000)
         self.tool()
         self.assertFalse(self.blocked(self.compact()))
         injected = self.returned()
@@ -352,8 +321,13 @@ class HookTest(unittest.TestCase):
         self.assertTrue(self.blocked(self.compact()))
         self.assertIn("compaction is waiting", self.ctx(self.run_hook("UserPromptSubmit", prompt="back")))
 
-    def test_nobody_near_the_trigger_is_not_held(self):
+    def test_held_wherever_claude_code_compacts(self):
+        # The session's own window may differ from settings.json: compaction coming is what counts.
         self.tokens("main", 120_000)
+        self.hold()
+
+    def test_below_any_compaction_point_is_not_held(self):
+        self.tokens("main", 60_000)
         self.tool()
         self.assertFalse(self.blocked(self.compact()))
         self.assertNotIn("main", self.agents())
@@ -412,26 +386,30 @@ class HookTest(unittest.TestCase):
              "tool_use_id": "t", "tool_response": "File created"}])
         self.assertTrue(self.blocked(self.compact()))
 
-    def test_old_announcement_is_ignored(self):
-        # An agent that announced but didn't compact (it finished, or the estimate was off) is no
-        # longer a candidate a few seconds later.
+    def test_agent_heard_from_long_ago_is_not_a_candidate(self):
+        # PreCompact follows the compacting agent's own request within milliseconds.
         self.tokens("main", 40_000)
         self.tokens("agentA", 300_000)
         self.tool("agentA")
-        self.age("agentA", 30, what="crossing")
-        self.assertFalse(self.blocked(self.compact()))
+        self.age("agentA", 30, what="recent")
+        self.assertFalse(self.blocked(self.compact()))  # main, at 40k, can't be at any compaction point
         self.assertNotIn("agentA", self.agents())
 
     def test_batch_results_count_toward_the_next_request(self):
-        self.tokens("main", 50_000)
-        self.tokens("agentA", 280_000)  # 17k below its 297k announcing point
-        self.tool("agentA", response="x" * 30_000)  # 10k tokens: still below
-        self.assertFalse(self.blocked(self.compact()))
-        self.tool("agentA", response=[{"type": "image", "source": {"data": "A" * 300_000}}])  # an image is 2k
-        self.assertFalse(self.blocked(self.compact()))
-        self.tool("agentA", response=[{"type": "text", "text": "x" * 60_000}])  # 20k tokens: crossing
-        self.assertTrue(self.blocked(self.compact()))
-        self.assertEqual(self.agents()["agentA"]["tokens"] // 1000, 300)  # the size of the next request
+        # The agent furthest along is picked by the size of its next request, as Claude Code counts it.
+        def picked(response):
+            self.tearDown()
+            self.setUp()
+            self.tokens("main", 291_000)
+            self.tokens("agentA", 280_000)
+            self.tool()
+            self.tool("agentA", response=response)
+            self.assertTrue(self.blocked(self.compact()))
+            return [a for a, st in self.agents().items() if "pending" in st]
+        self.assertEqual(picked("x" * 30_000), ["main"])  # 10k tokens: 290k
+        self.assertEqual(picked([{"type": "image", "source": {"data": "A" * 300_000}}]), ["main"])  # an image is 2k
+        self.assertEqual(picked([{"type": "text", "text": "x" * 60_000}]), ["agentA"])  # 20k tokens: 300k
+        self.assertEqual(self.agents()["agentA"]["tokens"] // 1000, 300)
 
     def test_failed_tool_in_a_batch_still_announces(self):
         self.tokens("main", 50_000)
@@ -536,15 +514,26 @@ class HookTest(unittest.TestCase):
         self.tokens(agent, tokens)
         self.run_hook("SubagentStart", agent, agent_type="Explore")
 
-    def test_newest_announcement_is_the_one_compacting(self):
-        self.tokens("main", 301_000)
+    def test_agent_furthest_along_is_the_one_compacting(self):
+        # Both made a request a moment ago; the one compacting is the one past its point.
+        self.tokens("main", 290_000)
+        self.tokens("A", 300_000)
+        self.tool("A")
+        time.sleep(0.01)
+        self.tool()
+        self.assertTrue(self.blocked(self.compact()))
+        self.assertIn("pending", self.agents()["A"])
+        self.assertNotIn("main", self.agents())
+
+    def test_a_tie_goes_to_the_latest(self):
+        self.tokens("main", 300_000)
         self.tokens("A", 300_000)
         self.tool()
         time.sleep(0.01)
         self.tool("A")
         self.assertTrue(self.blocked(self.compact()))
         self.assertIn("pending", self.agents()["A"])
-        self.assertNotIn("main", self.agents())  # main announced too, but A's request came last
+        self.assertNotIn("main", self.agents())
 
     def test_agent_below_its_point_is_not_a_candidate(self):
         self.tokens("main", 275_000)  # near its 300k point, but its next request doesn't cross it
@@ -570,12 +559,13 @@ class HookTest(unittest.TestCase):
         self.tool("A")  # the same compaction, tried again before it ran
         self.assertTrue(self.shortens_summary(self.compact()))
 
-    def test_small_window_agent_near_its_trigger_is_never_blocked(self):
-        self.tokens("main", 301_000)
-        self.tokens("h", 165_000, model="claude-haiku-4-5")  # crosses its 167k trigger with main
+    def test_small_window_agent_compacting_is_never_blocked(self):
+        self.tokens("main", 300_000)
+        self.tokens("h", 168_000, model="claude-haiku-4-5")  # past its 167k point
         self.tool()
         self.tool("h")
         self.assertFalse(self.blocked(self.compact()))
+        self.assertNotIn("main", self.agents())
 
     def test_small_window_agent_far_from_its_trigger_is_ignored(self):
         self.tokens("main", 301_000)
@@ -585,9 +575,9 @@ class HookTest(unittest.TestCase):
         self.assertTrue(self.blocked(self.compact()))
         self.assertIn("pending", self.agents()["main"])
 
-    def test_agent_at_its_limit_goes_through(self):
+    def test_compaction_first_coming_at_90_percent_goes_through(self):
         self.tokens("main", 300_000)
-        self.tokens("A", 460_000)
+        self.tokens("A", 905_000)
         self.tool()
         time.sleep(0.01)
         self.tool("A")
@@ -658,7 +648,7 @@ class HookTest(unittest.TestCase):
             "input_tokens": 1, "cache_read_input_tokens": 240_000, "output_tokens": 20_000}}}
         self.append("main", entry)
         self.hold()
-        self.assertEqual(self.agents()["main"]["tokens"], 260_001)
+        self.assertEqual(self.agents()["main"]["tokens"] // 1000, 260)
 
     # ---- compaction points
 
@@ -687,16 +677,15 @@ class HookTest(unittest.TestCase):
             return self.blocked(self.compact())
         ms = lambda key, w: {"modelSettings": {key: {"autoCompactWindow": w}}}
         self.assertTrue(held(300_000, "claude-opus-5-5", ms("claude-opus-5-5", 333000)))
-        self.assertFalse(held(240_000, "claude-opus-5-5", ms("claude-opus-5-5", 333000)))  # not near it yet
         self.assertTrue(held(300_000, "claude-opus-5-5-20260815", ms("claude-opus-5-5", 333000)))
         self.assertTrue(held(300_000, "us.anthropic.claude-opus-5-5-v1:0", ms("claude-opus-5-5", 333000)))
         self.assertFalse(held(300_000, "claude-opus-5-5", ms("claude-opus-5", 333000)))  # another model's key
         self.assertFalse(held(300_000, "claude-opus-5-5", {}))  # nothing set: the model's own 1M window
         auto = {"autoCompactWindow": 333000, "modelSettings": {"claude-opus-5-5": {"autoCompactWindow": "auto"}}}
         self.assertFalse(held(300_000, "claude-opus-5-5", auto))  # "auto": the model's own 1M window
-        # /autocompact 733k: it starts at about 700k, and the safety limit follows, 150k later.
+        # /autocompact 733k: it starts at about 700k; the safety limit is 150k later, at most 900k.
         self.assertTrue(held(700_000, "claude-opus-5-5", ms("claude-opus-5-5", 733000)))
-        self.assertFalse(held(860_000, "claude-opus-5-5", ms("claude-opus-5-5", 733000)))
+        self.assertFalse(held(905_000, "claude-opus-5-5", ms("claude-opus-5-5", 733000)))
         # "auto" starts at about 967k, past 90% of the window: never held.
         self.assertFalse(held(970_000, "claude-opus-5-5", ms("claude-opus-5-5", "auto")))
 
