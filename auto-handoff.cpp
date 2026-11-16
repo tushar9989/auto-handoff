@@ -14,7 +14,8 @@
 //
 // The hook doesn't need to know where a session compacts: a session keeps its own copy of the window,
 // which no hook can read. When PreCompact comes, Claude Code has decided, and the hook holds it if a
-// window is set for the model. But Claude Code's compaction hooks don't say which agent is compacting.
+// window is set for the model. One coming well below the point that window sets (a summary precompute
+// starting, idle compaction, a session on an older window) is put off until the point. But Claude Code's compaction hooks don't say which agent is compacting.
 // So before each request an agent makes, the hook notes its size, the way Claude Code counts it, in
 // recent/<agent>. PreCompact follows within milliseconds and takes the agent heard from a moment ago
 // that is furthest past its compaction point. After compaction each agent picks its own handoff from
@@ -73,6 +74,7 @@ const double kRecentSeconds = 5;           // PreCompact follows the compacting 
 const double kBytesPerToken = 3;           // Claude Code's size estimate for the 1M-window models (older: 4)
 const double kMediaTokens = 2000;          // and for each image or document
 const double kMinRoom = 40000;             // on only where the safety limit can be this far past the point
+const double kEarly = 10000;               // a compaction coming this far below the point is put off, not held
 const double kStaleGrowth = 20000;         // a handoff the context has grown this far past is asked for again
 const size_t kInjectCap = 9500;            // Claude Code moves hook context over 10,000 chars to a file
 const long kHandoffCap = 9000;             // a longer handoff holds compaction until it's trimmed
@@ -1650,6 +1652,18 @@ void on_pre_compact(const Json& in, const std::string& d) {
   Lock lock(d);
   Json st = load_state(d);
   the_limit(c, st);
+  // Well below the point the window in settings.json sets: a summary precompute starting in the
+  // background (2.1.325 runs PreCompact for it, about 34k early; its summary is later swapped in without
+  // another PreCompact, so letting it through would skip the handoff), idle compaction, or a session
+  // still on an older, lower window. Put off without asking: the compaction at the point is held. Agents
+  // that are never held (read-only, plan mode) go through as before.
+  if (c.u.tokens < c.trigger - kEarly && !busy(st.get("agents")->get(c.agent)) && !c.info.readonly &&
+      !planning(d, c.agent)) {
+    log(d, "compaction of " + c.agent + " put off: " + std::to_string(long(c.u.tokens)) + " tokens, below its point (" +
+               std::to_string(long(c.trigger)) + ")");
+    return block("auto-handoff: not compacting before " + thousands(c.trigger) +
+                 " tokens, the point the window in settings.json sets");
+  }
   std::string cwd = st.str("cwd").empty() ? in.str("cwd") : st.str("cwd");
   if (wants_hold(d, st, c)) {
     hold(d, st, c, t, cwd);

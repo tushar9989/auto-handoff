@@ -66,13 +66,17 @@ Once #91910 is fixed, all of this becomes a lookup of the agent's id.
   with a 200k window (too little room to wait). These compact as usual.
 - **`/compact`** always goes through, and loads a handoff if one was written.
 - **Idle compaction** (a Claude Code default) compacts sessions of 200k or more when you come back after
-  about an hour away. It saves re-reading the full context once the cache has expired. The hook holds it
-  like any other, so the session writes a handoff first, below your usual threshold. You can turn it off
-  in `/config`.
-- **Summary precompute** writes the summary in the background before compaction is due. It's gated on
-  Anthropic's side and may not be active for you. Going by Claude Code 2.1.302's code, a compaction
-  that uses it never calls PreCompact, so nothing is held and no handoff is written. To be safe, set
-  `precomputeCompactionEnabled` to false.
+  about an hour away. It saves re-reading the full context once the cache has expired. Below your
+  threshold, the hook puts it off without asking for anything, and the session compacts at your
+  threshold as usual, with its handoff. You can turn idle compaction off in `/config`.
+- **Summary precompute** writes the summary in the background, about 34k before compaction is due (on a
+  333k window), and swaps it in at the threshold. Since Claude Code 2.1.325 the start runs PreCompact,
+  but the swap doesn't. Below your threshold the hook puts the precompute off, so the compaction at the
+  threshold goes the usual way: held, handoff, loaded. Turning precompute off (`precomputeCompactionEnabled`
+  set to false, or "Precompute compaction" in `/config`) skips those extra attempts.
+- **A compaction well below the threshold** set in `settings.json`, by more than 10k, is put off the same
+  way: for example, a session still on an older, lower window. It compacts at the threshold in
+  `settings.json` instead.
 
 ## Limits
 

@@ -316,15 +316,48 @@ class HookTest(unittest.TestCase):
         self.assertIn("manual one", self.returned())
 
     def test_unannounced_compaction_near_the_point_is_held(self):
-        # Say idle compaction, or a background agent's report reaching main: no hook announced it.
-        self.tokens("main", 280_000)
+        # Say a background agent's report reaching main: no hook announced it.
+        self.tokens("main", 295_000)
         self.assertTrue(self.blocked(self.compact()))
         self.assertIn("compaction is waiting", self.ctx(self.run_hook("UserPromptSubmit", prompt="back")))
 
-    def test_held_wherever_claude_code_compacts(self):
-        # The session's own window may differ from settings.json: compaction coming is what counts.
-        self.tokens("main", 120_000)
+    def test_early_compaction_is_put_off_without_asking(self):
+        # Idle compaction, or a session still on an older, lower window: blocked, but nothing is asked
+        # until the compaction at the point settings.json sets.
+        for size in (120_000, 280_000):
+            self.tokens("main", size)
+            self.tool()
+            self.assertTrue(self.blocked(self.compact()))
+            self.assertNotIn("main", self.agents())
+            self.assertEqual(self.ctx(self.run_hook("UserPromptSubmit", prompt="back")), "")
+            self.assertIsNone(self.run_hook("Stop", stop_hook_active=False))
+        self.tokens("main", 300_000)
         self.hold()
+        self.assertIn("compaction is waiting", self.ctx(self.tool()))
+
+    def test_summary_precompute_is_put_off_until_the_point(self):
+        # 2.1.325 runs PreCompact when a summary precompute starts, about 34k before the point, and later
+        # swaps the summary in without another PreCompact. As seen in a 333k session: started at 266k.
+        self.tokens("main", 266_000)
+        self.tool()
+        self.assertTrue(self.blocked(self.compact()))
+        self.assertEqual(self.ctx(self.tool()), "")  # no handoff asked for yet
+        self.tokens("main", 300_000)
+        self.hold()  # the compaction at the point, through the usual path
+        self.assertIn("about 300k tokens", self.ctx(self.tool()))
+        self.write_handoff("main", "Owner: main session - at the point")
+        self.tool()
+        self.assertTrue(self.shortens_summary(self.compact()))
+        self.assertIn("at the point", self.returned())
+
+    def test_held_agent_is_not_put_off(self):
+        # Already waiting (held at its point): a later attempt is handled as before, never put off.
+        self.hold()
+        self.tokens("main", 289_000)  # shrank a little (under the 50k that stops the wait)
+        self.tool()
+        self.write_handoff("main", "Owner: main session - x")
+        self.tool()
+        self.assertTrue(self.shortens_summary(self.compact()))
 
     def test_below_any_compaction_point_is_not_held(self):
         self.tokens("main", 60_000)
@@ -645,10 +678,10 @@ class HookTest(unittest.TestCase):
 
     def test_output_tokens_count(self):
         entry = {"type": "assistant", "message": {"model": "claude-opus-5-5", "usage": {
-            "input_tokens": 1, "cache_read_input_tokens": 240_000, "output_tokens": 20_000}}}
+            "input_tokens": 1, "cache_read_input_tokens": 290_000, "output_tokens": 20_000}}}
         self.append("main", entry)
         self.hold()
-        self.assertEqual(self.agents()["main"]["tokens"] // 1000, 260)
+        self.assertEqual(self.agents()["main"]["tokens"] // 1000, 310)
 
     # ---- compaction points
 
