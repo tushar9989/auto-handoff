@@ -547,6 +547,27 @@ class HookTest(unittest.TestCase):
         self.tokens(agent, tokens)
         self.run_hook("SubagentStart", agent, agent_type="Explore")
 
+    def compact_as(self, agent):
+        """2.1.325 and later: a subagent's PreCompact carries its agent_id; main's carries none."""
+        return self.run_hook("PreCompact", agent, trigger="auto", custom_instructions=None)
+
+    def test_agent_id_in_precompact_decides(self):
+        # Seen live on 2.1.325: two parallel agents, timing pointed at the wrong one. The id doesn't.
+        self.tokens("main", 50_000)
+        self.tokens("A", 300_000)
+        self.tokens("B", 330_000)
+        self.tool("A")
+        self.tool("B")  # B is heard from last and is furthest along
+        self.assertTrue(self.blocked(self.compact_as("A")))
+        self.assertIn("pending", self.agents()["A"])
+        self.assertNotIn("B", self.agents())
+        # Once ids have been seen, a PreCompact without one is main's, whoever was heard from.
+        self.tokens("main", 300_000)
+        self.tool("B")
+        self.assertTrue(self.blocked(self.compact()))
+        self.assertIn("pending", self.agents()["main"])
+        self.assertNotIn("B", self.agents())
+
     def test_agent_furthest_along_is_the_one_compacting(self):
         # Both made a request a moment ago; the one compacting is the one past its point.
         self.tokens("main", 290_000)

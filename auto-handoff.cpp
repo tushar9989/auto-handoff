@@ -4,8 +4,8 @@
 // Every hook event runs this one binary (see README.md for the flow). Per-session state lives in
 // ~/.local/state/claude-handoffs/<session_id>/: a <agent>.md slot per agent ("main", or a subagent's
 // agent_id), state.json, recent/<agent> (that agent's size at its latest request), types/<agent> (its
-// agent_type), paths/<agent> (where that subagent's transcript is) and modes/<agent> (its permission
-// mode).
+// agent_type), paths/<agent> (where that subagent's transcript is), modes/<agent> (its permission
+// mode) and ids (there once a PreCompact has carried an agent_id).
 //
 // Writing the slot is the signal that the handoff is ready. The slot holds the handoff itself, or the
 // path of a handoff file the session already keeps (say a HANDOFF.md in the project), which stays
@@ -27,9 +27,9 @@
 // Undocumented Claude Code behaviour it relies on, measured on 2.1.302 (re-run `make live` after upgrades):
 // - auto-compact is checked before every request, mid-turn too, and tried again at the next one after a
 //   PreCompact block;
-// - PostToolBatch carries agent_id and comes about 40ms before that agent's PreCompact. PreCompact and
-//   SessionStart(compact) carry no agent id (anthropics/claude-code#91910), and SessionStart's model is
-//   often missing;
+// - PostToolBatch carries agent_id and comes about 40ms before that agent's PreCompact. Before 2.1.325,
+//   PreCompact and SessionStart(compact) carry no agent id (anthropics/claude-code#91910); since, a
+//   subagent's do. SessionStart's model is often missing;
 // - the check sizes the context as the last response's usage plus what's added since, at 3 bytes per
 //   token (4 for older models), 2,000 per image or document;
 // - each compaction writes a compact_boundary line into the compacted agent's own transcript;
@@ -1111,7 +1111,18 @@ Usage note_size(const std::string& d, const std::string& transcript, const std::
 // share a window, so the one compacting is at least as far along as any that isn't. With none heard from
 // (a request no hook saw coming, such as a background agent's report reaching main, or idle compaction),
 // the main session. Below the lowest point any window allows, it isn't an auto-compaction to wait on.
-bool compacting(const std::string& d, const std::string& transcript, double t, Candidate& out) {
+//
+// Since 2.1.325 a subagent's PreCompact carries its agent_id (#91910), and main's carries none: once a
+// session has shown an id, the input says who it is, and timing is only the fallback for older versions.
+bool compacting(const std::string& d, const Json& in, double t, Candidate& out) {
+  std::string transcript = in.str("transcript_path"), id = in.str("agent_id");
+  if (!id.empty() || mtime(d + "/ids") >= 0) {
+    std::string who = id.empty() ? "main" : id, p = d + "/recent/" + who, est;
+    bool fresh = mtime(p) >= t - kRecentSeconds && read_file(p, est);
+    out = candidate(d, transcript, who, fresh ? atof(est.c_str()) : 0);
+    if (!id.empty() && mtime(d + "/ids") < 0) mkdirs(d), write_atomic(d + "/ids", "");
+    return out.u.tokens >= kMinPoint;
+  }
   bool found = false;
   double out_t = 0;
   for (const auto& agent : list_dir(d + "/recent")) {
@@ -1646,7 +1657,7 @@ void on_pre_compact(const Json& in, const std::string& d) {
   }
 
   Candidate c;
-  if (!compacting(d, in.str("transcript_path"), t, c))
+  if (!compacting(d, in, t, c))
     return log(d, "compaction allowed: below any compaction point (" + std::to_string(long(c.u.tokens)) + " tokens)");
   if (!c.on) return log(d, "compaction of " + c.agent + " allowed: the hook is off for its model");
   Lock lock(d);

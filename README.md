@@ -45,20 +45,19 @@ messages the agent was given, word for word, and the git state.
 
 ## Which agent is compacting
 
-Claude Code doesn't tell a PreCompact hook which agent is compacting. When a subagent compacts, the
-input carries the main session's id, even though Claude Code has the agent's id at hand. That's
-[anthropics/claude-code#91910](https://github.com/anthropics/claude-code/issues/91910). Without the id,
-a hook can't tell whose handoff to wait for or load. Guessing from which transcript changed last fails
-with parallel subagents.
+Since Claude Code 2.1.325, a subagent's PreCompact carries its `agent_id` and the main session's
+carries none, so the hook knows which agent is compacting
+([anthropics/claude-code#91910](https://github.com/anthropics/claude-code/issues/91910)). Once a
+session has shown an id, a PreCompact without one is the main session's.
 
-So the hook goes by timing. The hooks that run just before each request do carry the agent's id: after
-each batch of tool calls, on a prompt, and on a Stop the hook blocks. There, the hook notes the agent's
-size, counted the way Claude Code counts it. PreCompact follows the compacting agent's own request within
-about 40ms, so the hook takes the agent heard from in the last few seconds that is furthest past its
-compaction point. Agents on one model share a window, so the one compacting is at least as far along as
-any other. If two agents compact in the same instant and the wrong one is taken, each still gets its own
-handoff back: handoffs are labelled by owner, and an agent that wasn't compacted goes back to waiting.
-Once #91910 is fixed, all of this becomes a lookup of the agent's id.
+Before that, Claude Code didn't say, so the hook goes by timing until it sees an id. The hooks that run
+just before each request do carry the agent's id: after each batch of tool calls, on a prompt, and on a
+Stop the hook blocks. There, the hook notes the agent's size, counted the way Claude Code counts it.
+PreCompact follows the compacting agent's own request within about 40ms, so the hook takes the agent
+heard from in the last few seconds that is furthest past its compaction point. With parallel subagents
+this can pick the wrong one (seen live on 2.1.325, where the id now prevents it). Each agent still gets
+its own handoff back: handoffs are labelled by owner, and an agent that wasn't compacted goes back to
+waiting.
 
 ## Other cases
 
